@@ -1,0 +1,139 @@
+{
+  "trigger_keywords": {
+    "type": "string",
+    "description": "【触发】触发关键词",
+    "hint": "回复图片（或当前消息带图）后发送这些词之一即可触发鉴图，用 | 分隔多个词。可附带风格词，如“打分 毒舌”。",
+    "default": "打分|鉴图|点评|评价|锐评"
+  },
+  "enable_auto_trigger": {
+    "type": "bool",
+    "description": "【触发】自动对群里所有图片鉴图",
+    "hint": "默认关闭（省额度）。开启后群里每张图片都按概率触发鉴图，建议配合群白名单和冷却使用。注意：会消耗较多模型额度。",
+    "default": false
+  },
+  "auto_trigger_probability": {
+    "type": "int",
+    "description": "【触发】自动触发概率（%）",
+    "hint": "0-100。比如填 20 表示大约每 5 张图触发一次。填 100 表示每张图都触发。",
+    "default": 20
+  },
+  "auto_trigger_cooldown_seconds": {
+    "type": "int",
+    "description": "【触发】自动触发冷却（秒）",
+    "hint": "同一群自动触发后，这段时间内不再自动触发，避免刷屏。关键词触发不受此限制。",
+    "default": 300
+  },
+  "group_allowlist": {
+    "type": "string",
+    "description": "【触发】自动触发群白名单",
+    "hint": "留空表示所有群都参与自动触发；填群号用英文逗号分隔，如 123456789,987654321。只影响自动触发，不影响关键词触发。",
+    "default": ""
+  },
+  "private_enable": {
+    "type": "bool",
+    "description": "【触发】允许私聊使用",
+    "hint": "关闭后私聊发图片不会触发鉴图。",
+    "default": true
+  },
+  "ignore_sticker": {
+    "type": "bool",
+    "description": "【图片】忽略表情包/贴图",
+    "hint": "开启后跳过表情包和贴图（按消息组件类型识别），避免给表情包打分。",
+    "default": true
+  },
+  "ignore_gif": {
+    "type": "bool",
+    "description": "【图片】忽略 GIF 动图",
+    "hint": "开启后跳过 GIF 图片（多数视觉模型不支持 GIF）。关闭时自动取 GIF 第一帧。",
+    "default": true
+  },
+  "max_images_per_message": {
+    "type": "int",
+    "description": "【图片】单条消息最多鉴几张图",
+    "hint": "同一消息/同一回复里图片超过此数量时只取前几张。",
+    "default": 1
+  },
+  "max_image_mb": {
+    "type": "int",
+    "description": "【图片】单张图片大小上限（MB）",
+    "hint": "超过上限的图片直接跳过。下载后也会做压缩归一化，防止超大图发送失败。",
+    "default": 8
+  },
+  "vision_provider_id": {
+    "type": "string",
+    "description": "【模型】鉴图专用模型",
+    "hint": "推荐留空，自动使用当前会话的模型。如果当前模型不支持看图，请在这里指定一个多模态（视觉）模型。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "style": {
+    "type": "string",
+    "description": "【模型】默认吐槽风格",
+    "hint": "关键词触发时可临时指定风格，如“打分 彩虹屁”。",
+    "options": [
+      "毒舌",
+      "客观",
+      "彩虹屁"
+    ],
+    "default": "毒舌"
+  },
+  "custom_prompt": {
+    "type": "string",
+    "description": "【模型】自定义系统提示词（可选）",
+    "hint": "留空使用内置提示词。填写后覆盖默认的评委人设，仍会要求输出 SCORE/REASON/ROAST 三行格式。",
+    "default": ""
+  },
+  "temperature": {
+    "type": "string",
+    "description": "【模型】生成温度",
+    "hint": "0-2 之间的浮点数，填 0.9 即可。越高越放飞。",
+    "default": "0.9"
+  },
+  "timeout_seconds": {
+    "type": "int",
+    "description": "【模型】模型请求超时（秒）",
+    "hint": "模型响应较慢时调大。超时会提示稍后重试。",
+    "default": 60
+  },
+  "render_mode": {
+    "type": "string",
+    "description": "【输出】结果形式",
+    "hint": "text：直接发文字（省流量）；card：渲染成评分卡片图（大字分数+吐槽），需要 AstrBot 已配置好 HTML 渲染服务。",
+    "options": [
+      "text",
+      "card"
+    ],
+    "default": "text"
+  },
+  "card_theme": {
+    "type": "string",
+    "description": "【输出】评分卡片主题",
+    "hint": "仅在 render_mode 为 card 时生效。可在命令中临时指定，如“打分 复古”。",
+    "options": [
+      "霓虹",
+      "极简",
+      "复古",
+      "赛博朋克",
+      "马卡龙"
+    ],
+    "default": "霓虹"
+  },
+  "show_error_message": {
+    "type": "bool",
+    "description": "【输出】失败时是否显示错误",
+    "hint": "关闭后失败静默，不打扰群聊。",
+    "default": true
+  },
+  "user_cooldown_seconds": {
+    "type": "int",
+    "description": "【限制】同一用户冷却（秒）",
+    "hint": "同一用户两次成功鉴图之间的最短间隔。填 0 关闭。",
+    "default": 60
+  },
+  "daily_limit": {
+    "type": "int",
+    "description": "【限制】每用户每日鉴图上限",
+    "hint": "按自然日计数，成功调用模型才计数。填 0 表示不限。",
+    "default": 20
+  }
+}

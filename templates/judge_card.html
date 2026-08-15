@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      min-width: 820px;
+      font-family: "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif;
+      letter-spacing: 0;
+    }
+
+    /* ---- 主题变量 ---- */
+    body.theme-neon {
+      --bg: #171a21;
+      --card-bg: #1d212b;
+      --panel-bg: #12151c;
+      --border: #333a47;
+      --text: #f2f3f5;
+      --muted: #8b93a7;
+      --chip-bg: #262b37;
+      --font: "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif;
+    }
+    body.theme-minimal {
+      --bg: #eef0f3;
+      --card-bg: #ffffff;
+      --panel-bg: #f6f7f8;
+      --border: #d8dadd;
+      --text: #18191c;
+      --muted: #6d757a;
+      --chip-bg: #f1f2f3;
+      --font: "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif;
+    }
+    body.theme-retro {
+      --bg: #e8dcc3;
+      --card-bg: #f6eeda;
+      --panel-bg: #efe3c6;
+      --border: #4a3f2f;
+      --text: #2e2a22;
+      --muted: #7a6f5c;
+      --chip-bg: #e6d7b4;
+      --font: Georgia, "Times New Roman", "STSong", "SimSun", serif;
+    }
+    body.theme-cyber {
+      --bg: #0a0e1a;
+      --card-bg: #10162b;
+      --panel-bg: #0a0f20;
+      --border: #2e3f6e;
+      --text: #d9f4ff;
+      --muted: #7f8fb8;
+      --chip-bg: #141c38;
+      --font: "Consolas", "Microsoft YaHei", "Noto Sans CJK SC", monospace;
+    }
+    body.theme-macaron {
+      --bg: #fdeef4;
+      --card-bg: #fff7fb;
+      --panel-bg: #fde9f1;
+      --border: #f3c3d6;
+      --text: #5c4a52;
+      --muted: #b48a9c;
+      --chip-bg: #fce3ee;
+      --font: "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif;
+    }
+
+    .canvas {
+      width: 100%;
+      padding: 26px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+    }
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 58px;
+      padding: 0 22px;
+      background: var(--panel-bg);
+      border: 2px solid {{ score_color | safe }};
+      border-bottom: 0;
+      border-radius: 10px 10px 0 0;
+    }
+    .brand { font-size: 24px; font-weight: 800; color: {{ score_color | safe }}; }
+    .brand-sub { font-size: 14px; font-weight: 600; color: var(--muted); }
+    .card {
+      padding: 28px;
+      background: var(--card-bg);
+      border: 2px solid {{ score_color | safe }};
+      border-radius: 0 0 10px 10px;
+    }
+    .body { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 26px; }
+    .image-box {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 300px;
+      background: var(--panel-bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .image-box img {
+      width: 100%;
+      max-height: 420px;
+      object-fit: contain;
+      display: block;
+    }
+    .image-fallback {
+      color: var(--muted);
+      font-size: 16px;
+      font-weight: 700;
+      padding: 40px 20px;
+      text-align: center;
+    }
+    .score-panel { display: flex; flex-direction: column; justify-content: center; }
+    .score-value {
+      font-size: 84px;
+      line-height: 1;
+      font-weight: 900;
+      color: {{ score_color | safe }};
+      letter-spacing: 1px;
+    }
+    .score-label { margin-top: 8px; font-size: 22px; font-weight: 800; color: var(--text); }
+    .stars { margin-top: 12px; font-size: 30px; color: {{ score_color | safe }}; letter-spacing: 4px; }
+    .reason {
+      margin-top: 18px;
+      padding: 12px 16px;
+      background: var(--panel-bg);
+      border-left: 4px solid {{ score_color | safe }};
+      border-radius: 0 8px 8px 0;
+      font-size: 17px;
+      line-height: 1.7;
+      color: var(--text);
+    }
+    .roast {
+      margin-top: 24px;
+      padding: 20px 22px;
+      background: var(--panel-bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      font-size: 26px;
+      font-weight: 800;
+      line-height: 1.6;
+      color: var(--text);
+      overflow-wrap: anywhere;
+    }
+    .footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: 24px;
+      padding-top: 18px;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .style-chip {
+      padding: 5px 12px;
+      background: var(--chip-bg);
+      border: 1px solid {{ score_color | safe }};
+      border-radius: 999px;
+      color: {{ score_color | safe }};
+      font-weight: 700;
+    }
+  </style>
+</head>
+<body class="theme-{{ theme }}">
+  <main class="canvas">
+    <header class="topbar">
+      <div class="brand">AI 鉴图官</div>
+      <div class="brand-sub">风格 · {{ style_name | safe }}</div>
+    </header>
+    <article class="card">
+      <section class="body">
+        <div class="image-box">
+          {% if image_src %}
+          <img src="{{ image_src | safe }}" alt="" decoding="sync">
+          {% else %}
+          <div class="image-fallback">原图不可用</div>
+          {% endif %}
+        </div>
+        <div class="score-panel">
+          <div class="score-value">{{ score }}</div>
+          <div class="score-label">SCORE · {{ score_label | safe }}</div>
+          <div class="stars">{{ stars | safe }}</div>
+          {% if reason %}
+          <div class="reason">{{ reason | safe }}</div>
+          {% endif %}
+        </div>
+      </section>
+      <section class="roast">{{ roast | safe }}</section>
+      <footer class="footer">
+        <div>{{ footer | safe }}</div>
+        <span class="style-chip">{{ style_name | safe }}</span>
+      </footer>
+    </article>
+  </main>
+</body>
+</html>

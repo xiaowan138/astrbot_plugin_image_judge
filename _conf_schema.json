@@ -35,6 +35,12 @@
     "hint": "关闭后私聊发图片不会触发鉴图。",
     "default": true
   },
+  "enable_avatar_judge": {
+    "type": "bool",
+    "description": "【触发】头像鉴图（锐评 @某人）",
+    "hint": "关键词消息里 @ 某人且没有图片时，自动抓取对方 QQ 头像进行鉴图。主要支持 QQ 平台。",
+    "default": true
+  },
   "ignore_sticker": {
     "type": "bool",
     "description": "【图片】忽略表情包/贴图",
@@ -84,10 +90,10 @@
     "default": ""
   },
   "temperature": {
-    "type": "string",
+    "type": "float",
     "description": "【模型】生成温度",
     "hint": "0-2 之间的浮点数，填 0.9 即可。越高越放飞。",
-    "default": "0.9"
+    "default": 0.9
   },
   "timeout_seconds": {
     "type": "int",

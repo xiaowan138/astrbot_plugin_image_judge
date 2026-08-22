@@ -1,8 +1,8 @@
 name: astrbot_plugin_image_judge
 display_name: AI 鉴图评分
-desc: 群友发图片（或回复图片并发“打分”），机器人调用 AstrBot 已配置的多模态模型对图片打分并锐评吐槽，纯娱乐。可选渲染成评分卡片图。
+desc: 群友发图片（或回复图片并发“打分”、@某人锐评头像），机器人调用 AstrBot 已配置的多模态模型对图片打分并锐评吐槽，纯娱乐。可选渲染成评分卡片图，支持群管理指令调自动鉴图。
 short_desc: AI 鉴图打分与锐评吐槽。
-version: v0.2.0
+version: v0.3.0
 author: xiaowan
 repo: https://github.com/xiaowan138/astrbot_plugin_image_judge
 astrbot_version: ">=4.5.7,<5"

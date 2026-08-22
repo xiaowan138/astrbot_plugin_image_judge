@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 from typing import Any
 
 from .judge import Judgement
@@ -59,14 +60,16 @@ def build_card_context(
     theme: str = DEFAULT_THEME,
 ) -> dict[str, Any]:
     score = judgement.score if judgement.score is not None else 0
+    # 卡片模板对文本字段用了 | safe，模型输出可能带 HTML 标签，这里先转义，
+    # 防止排版被破坏（文本输出 build_text_result 不转义）。
     return {
         "score": score,
         "score_label": f"{score}/100",
         "stars": stars(score),
         "score_color": score_color(score),
-        "style_name": style_name,
-        "reason": judgement.reason or "（模型没有给出理由）",
-        "roast": judgement.roast or "（模型没有给出吐槽）",
+        "style_name": html.escape(style_name, quote=False),
+        "reason": html.escape(judgement.reason or "（模型没有给出理由）", quote=False),
+        "roast": html.escape(judgement.roast or "（模型没有给出吐槽）", quote=False),
         "image_src": image_src,
         "theme": resolve_theme(theme),
         "footer": "AI 鉴图评分 · 纯娱乐",

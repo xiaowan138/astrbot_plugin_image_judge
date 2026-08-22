@@ -8,7 +8,9 @@ from image_judge.image_utils import (
     _compress_for_provider,
     _mime_from_magic,
     extract_image_urls,
+    is_plausible_image_ref,
     normalize_image_ref,
+    qq_avatar_url,
 )
 from PIL import Image
 
@@ -151,6 +153,90 @@ class NormalizeTests(unittest.TestCase):
                     timeout_seconds=5,
                 )
             )
+        )
+
+
+class DataUriNormalizeTests(unittest.TestCase):
+    """data URI 与其他引用同规矩：大小上限、魔数识别与压缩都不豁免。"""
+
+    def _png_data_uri(self) -> str:
+        return _bytes_to_data_url(make_png_bytes(), "image/png")
+
+    def test_png_data_uri_is_normalized_and_compressed(self):
+        normalized = asyncio.run(
+            normalize_image_ref(
+                self._png_data_uri(), FakeSession(), max_bytes=1024 * 1024, timeout_seconds=5
+            )
+        )
+        self.assertIsNotNone(normalized)
+        self.assertFalse(normalized.is_gif)
+        self.assertTrue(normalized.data_url.startswith("data:image/jpeg;base64,"))
+
+    def test_oversized_data_uri_rejected(self):
+        normalized = asyncio.run(
+            normalize_image_ref(
+                self._png_data_uri(), FakeSession(), max_bytes=10, timeout_seconds=5
+            )
+        )
+        self.assertIsNone(normalized)
+
+    def test_broken_data_uri_rejected(self):
+        normalized = asyncio.run(
+            normalize_image_ref(
+                "data:image/png;base64,@@not-base64@@",
+                FakeSession(),
+                max_bytes=1024 * 1024,
+                timeout_seconds=5,
+            )
+        )
+        self.assertIsNone(normalized)
+
+    def test_non_image_data_uri_rejected(self):
+        normalized = asyncio.run(
+            normalize_image_ref(
+                _bytes_to_data_url(b"plain text file", "image/png"),
+                FakeSession(),
+                max_bytes=1024 * 1024,
+                timeout_seconds=5,
+            )
+        )
+        self.assertIsNone(normalized)
+
+    def test_gif_data_uri_flagged_and_first_frame_extracted(self):
+        uri = _bytes_to_data_url(make_gif_bytes(), "image/gif")
+        normalized = asyncio.run(
+            normalize_image_ref(
+                uri, FakeSession(), max_bytes=1024 * 1024, timeout_seconds=5, first_frame_gif=True
+            )
+        )
+        self.assertIsNotNone(normalized)
+        self.assertTrue(normalized.is_gif)
+        self.assertTrue(normalized.data_url.startswith("data:image/jpeg;base64,"))
+
+
+class PlausibleRefTests(unittest.TestCase):
+    def test_urls_and_paths_are_plausible(self):
+        for value in (
+            "https://gchat.qpic.cn/abc",
+            "http://a.com/b.jpg",
+            "data:image/png;base64,xxx",
+            "base64://xxx",
+            "file:///tmp/a.png",
+            "/home/astrbot/data/x.jpg",
+            "C:\\astrbot\\cache\\x.jpg",
+        ):
+            self.assertTrue(is_plausible_image_ref(value), value)
+
+    def test_bare_cache_filenames_are_not_plausible(self):
+        for value in ("", "ABC123.image", "abc.jpg", "   "):
+            self.assertFalse(is_plausible_image_ref(value), value)
+
+
+class AvatarUrlTests(unittest.TestCase):
+    def test_qq_avatar_url_format(self):
+        self.assertEqual(
+            qq_avatar_url("123456"),
+            "https://q1.qlogo.cn/g?b=qq&nk=123456&s=640",
         )
 
 

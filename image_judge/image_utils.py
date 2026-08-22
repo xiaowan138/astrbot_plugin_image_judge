@@ -32,6 +32,23 @@ DEFAULT_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 
+_PLAUSIBLE_REF_PREFIXES = ("http://", "https://", "data:", "base64://", "file://")
+
+
+def is_plausible_image_ref(value: str) -> bool:
+    """引用是否是可直接解析的形态（URL/data URI/base64/本地路径）。
+
+    部分平台的 ``Image.file`` 只是缓存文件名（如 ``ABC123.image``），既不是
+    URL 也不是路径，不应挡住可用的 ``url``。
+    """
+    value = (value or "").strip()
+    return value.startswith(_PLAUSIBLE_REF_PREFIXES) or "/" in value or "\\" in value
+
+
+def qq_avatar_url(qq: str, size: int = 640) -> str:
+    """QQ 头像直链（“锐评 @某人”用）；仅对纯数字 QQ 号有意义。"""
+    return f"https://q1.qlogo.cn/g?b=qq&nk={qq}&s={size}"
+
 
 @dataclass(frozen=True, slots=True)
 class NormalizedImage:
@@ -131,9 +148,12 @@ async def normalize_image_ref(
         return None
 
     if _DATA_URI_RE.match(value):
-        return NormalizedImage(value, "image/jpeg", False)
-
-    if _BASE64_PREFIX_RE.match(value):
+        # data URI 与其他引用同规矩：大小上限、魔数识别、GIF 处理与压缩都不豁免。
+        try:
+            raw = base64.b64decode(value.split(",", 1)[1], validate=True)
+        except (IndexError, ValueError, TypeError):
+            return None
+    elif _BASE64_PREFIX_RE.match(value):
         try:
             raw = base64.b64decode(value[len("base64://"):], validate=True)
         except (ValueError, TypeError):

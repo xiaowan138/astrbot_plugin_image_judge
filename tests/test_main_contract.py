@@ -40,7 +40,57 @@ class MainHandlerContractTests(unittest.TestCase):
     def test_handler_returns_early_when_not_matched(self):
         source = main_source()
         self.assertIn("handled, auto_mode = await self._match_trigger(event)", source)
-        self.assertIn("if not handled:\n                return", source)
+        # 未命中触发时在管理指令分支的 else 内直接返回。
+        self.assertIn("if not handled:\n                    return", source)
+
+    def test_admin_commands_are_parsed_before_normal_trigger(self):
+        source = main_source()
+        self.assertIn("parse_admin_command(event.message_str", source)
+        self.assertIn("_exec_admin_command", source)
+        # 管理指令必须先于普通触发解析（指令文本本身含触发词）。
+        self.assertLess(
+            source.index("parse_admin_command(event.message_str"),
+            source.index("await self._match_trigger(event)"),
+        )
+        self.assertIn("_is_group_admin", source)
+
+    def test_private_chat_gate_is_enforced(self):
+        source = main_source()
+        self.assertIn('"private_enable"', source)
+        self.assertIn("self._group_id(event)", source)
+
+    def test_auto_trigger_only_fires_on_messages_that_may_carry_image(self):
+        source = main_source()
+        self.assertIn("_may_carry_image(event)", source)
+        self.assertIn("isinstance(comp, Comp.Reply)", source)
+
+    def test_auto_cooldown_marked_only_after_images_collected(self):
+        source = main_source()
+        self.assertIn("_auto_cooldown.mark", source)
+        mark_line = source.index("_auto_cooldown.mark")
+        collect_line = source.index("images = await self._collect_images(event)")
+        self.assertGreater(mark_line, collect_line)
+
+    def test_auto_mode_failures_stay_silent(self):
+        source = main_source()
+        for snippet in (
+            "if not auto_mode:\n                yield",
+            "if not auto_mode and bool(self.config.get(\"show_error_message\", True)):",
+        ):
+            self.assertIn(snippet, source)
+
+    def test_avatar_fallback_judges_at_targets(self):
+        source = main_source()
+        self.assertIn("_avatar_refs(message_parts)", source)
+        self.assertIn("isinstance(comp, Comp.At)", source)
+        self.assertIn("qq_avatar_url(qq)", source)
+        self.assertIn('"enable_avatar_judge"', source)
+
+    def test_group_overrides_are_persisted_via_data_dir(self):
+        source = main_source()
+        self.assertIn("GroupConfigStore(", source)
+        self.assertIn("StarTools", source)
+        self.assertIn("group_config.json", source)
 
     def test_images_are_normalized_to_data_urls_before_llm(self):
         source = main_source()
@@ -70,7 +120,7 @@ class MainHandlerContractTests(unittest.TestCase):
     def test_image_refs_come_from_message_chain_or_raw_message(self):
         source = main_source()
         self.assertIn("isinstance(comp, Comp.Image)", source)
-        self.assertIn("comp.file or comp.url", source)
+        self.assertIn("is_plausible_image_ref(value)", source)
         self.assertIn("extract_image_urls(", source)
 
     def test_replied_images_are_collected_in_three_tiers(self):
@@ -114,6 +164,8 @@ class MainHandlerContractTests(unittest.TestCase):
             "auto_trigger_probability",
             "auto_trigger_cooldown_seconds",
             "group_allowlist",
+            "private_enable",
+            "enable_avatar_judge",
             "ignore_sticker",
             "ignore_gif",
             "max_images_per_message",

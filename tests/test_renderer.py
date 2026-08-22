@@ -55,6 +55,27 @@ class RendererTests(unittest.TestCase):
         context = build_card_context(judgement, "毒舌")
         self.assertEqual(context["score"], 0)
 
+    def test_card_context_escapes_model_output(self):
+        # 模板对文本字段用了 | safe，模型输出带 HTML 标签时必须先转义。
+        judgement = Judgement(
+            score=80,
+            reason='构图 <b>不错</b> & 饱和度 "高"',
+            roast="<img src=x onerror=alert(1)>离谱",
+            raw="x",
+        )
+        context = build_card_context(judgement, "毒舌")
+        self.assertNotIn("<b>", context["reason"])
+        self.assertIn("&lt;b&gt;", context["reason"])
+        self.assertNotIn("<img", context["roast"])
+        self.assertIn("&lt;img", context["roast"])
+        self.assertIn("&amp;", context["reason"])
+
+    def test_text_result_is_not_escaped(self):
+        # 文本输出直接发到聊天，不需要 HTML 转义。
+        judgement = Judgement(score=80, reason="构图 <b>不错</b>", roast="", raw="x")
+        text = build_text_result(judgement, "毒舌")
+        self.assertIn("<b>不错</b>", text)
+
 
 class ThemeTests(unittest.TestCase):
     def test_theme_aliases_cover_five_themes(self):

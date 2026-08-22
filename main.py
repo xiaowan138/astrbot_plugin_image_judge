@@ -12,13 +12,25 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 import astrbot.api.message_components as Comp
 
+try:
+    from astrbot.api.star import StarTools
+except ImportError:  # 兼容无 StarTools 的旧版本
+    try:
+        from astrbot.core.star.star_tools import StarTools
+    except ImportError:
+        StarTools = None
+
 from .image_judge import prompts
 from .image_judge import renderer as card_renderer
+from .image_judge.admin import AdminCommand, parse_admin_command
 from .image_judge.cooldown import DailyQuota, UserCooldown
+from .image_judge.group_config import GroupConfigStore, effective_settings
 from .image_judge.image_utils import (
     DEFAULT_USER_AGENT,
     extract_image_urls,
+    is_plausible_image_ref,
     normalize_image_ref,
+    qq_avatar_url,
 )
 from .image_judge.judge import parse_judgement
 
@@ -47,6 +59,18 @@ class ImageJudgePlugin(Star):
             self._config_int("auto_trigger_cooldown_seconds", 300, 0, 86400)
         )
         self._quota = DailyQuota(self._config_int("daily_limit", 20, 0, 10000))
+        self._group_config = GroupConfigStore(
+            self._data_dir() / "group_config.json"
+        )
+
+    @staticmethod
+    def _data_dir() -> Path:
+        try:
+            if StarTools is not None:
+                return StarTools.get_data_dir("astrbot_plugin_image_judge")
+        except Exception:
+            pass
+        return Path(__file__).parent / "data"
 
     def _compile_keywords(self) -> re.Pattern:
         raw = str(
@@ -64,23 +88,32 @@ class ImageJudgePlugin(Star):
         handled = False
         auto_mode = False
         try:
-            handled, auto_mode = await self._match_trigger(event)
-            if not handled:
-                return
-            async for result in self._handle_judge(event, auto_mode):
-                yield result
+            # 管理指令文本含触发词（如“鉴图开启”含“鉴图”），必须先于普通触发解析。
+            admin_command = parse_admin_command(event.message_str or "")
+            if admin_command is not None:
+                async for result in self._exec_admin_command(event, admin_command):
+                    yield result
+                handled = True
+            else:
+                handled, auto_mode = await self._match_trigger(event)
+                if not handled:
+                    return
+                async for result in self._handle_judge(event, auto_mode):
+                    yield result
         except Exception:
             logger.exception("AI 鉴图发生未预期错误")
             if not auto_mode and bool(self.config.get("show_error_message", True)):
                 yield event.plain_result("鉴图失败，请稍后重试。")
         finally:
-            # 关键词触发时用户意图明确，终止事件传播；自动触发不打扰主 agent。
+            # 关键词/管理指令触发时用户意图明确，终止事件传播；自动触发不打扰主 agent。
             if handled and not auto_mode:
                 event.stop_event()
 
     async def _match_trigger(self, event: AstrMessageEvent) -> tuple[bool, bool]:
         """返回 (是否处理本条消息, 是否为自动触发模式)。"""
         text = event.message_str or ""
+        if not bool(self.config.get("private_enable", True)) and not self._group_id(event):
+            return False, False
         if self._keywords_re.search(text):
             return True, False
 
@@ -94,19 +127,42 @@ class ImageJudgePlugin(Star):
             allowed = {g.strip() for g in allowlist.split(",") if g.strip()}
             if group_id not in allowed:
                 return False, False
-        probability = self._config_int("auto_trigger_probability", 20, 0, 100)
-        if probability <= 0 or random.randint(1, 100) > probability:
+        settings = effective_settings(
+            global_enabled=True,
+            global_probability=self._config_int(
+                "auto_trigger_probability", 20, 0, 100
+            ),
+            override=self._group_config.get(group_id),
+        )
+        if not settings.enabled:
+            return False, False
+        # 自动触发只对可能带图的消息掷概率，纯文本不浪费概率与群冷却。
+        if not self._may_carry_image(event):
+            return False, False
+        if settings.probability <= 0 or random.randint(1, 100) > settings.probability:
             return False, False
         if not await self._auto_cooldown.is_ok(f"group\x1f{group_id}"):
             return False, False
         return True, True
 
-    async def _handle_judge(self, event: AstrMessageEvent, auto_mode: bool):
-        if auto_mode:
-            group_id = self._group_id(event)
-            if group_id:
-                await self._auto_cooldown.mark(f"group\x1f{group_id}")
+    def _may_carry_image(self, event: AstrMessageEvent) -> bool:
+        """轻量判断消息是否可能带图：含图片组件（跳过表情包）或回复组件。"""
+        try:
+            message_parts = event.get_messages()
+        except (AttributeError, TypeError):
+            message_parts = []
+        ignore_sticker = bool(self.config.get("ignore_sticker", True))
+        has_reply = False
+        for comp in message_parts:
+            if isinstance(comp, Comp.Image):
+                if ignore_sticker and self._is_sticker(comp):
+                    continue
+                return True
+            if isinstance(comp, Comp.Reply):
+                has_reply = True
+        return has_reply
 
+    async def _handle_judge(self, event: AstrMessageEvent, auto_mode: bool):
         images = await self._collect_images(event)
         max_images = self._config_int("max_images_per_message", 1, 1, 10)
         images = images[:max_images]
@@ -115,14 +171,20 @@ class ImageJudgePlugin(Star):
                 return
             yield event.plain_result("请回复一张图片（或直接发图），再发送“打分”触发鉴图。")
             return
+        if auto_mode:
+            # 确认有图才消耗群冷却，纯文本不烧掉自动触发机会。
+            group_id = self._group_id(event)
+            if group_id:
+                await self._auto_cooldown.mark(f"group\x1f{group_id}")
 
         user_key = self._user_key(event)
-        if not await self._cooldown.is_ok(user_key):
-            yield event.plain_result("你鉴图太频繁啦，歇一会儿再来。")
-            return
-        if not await self._quota.can_use(user_key):
-            yield event.plain_result("今天的鉴图次数用完啦，明天再来。")
-            return
+        if not auto_mode:
+            if not await self._cooldown.is_ok(user_key):
+                yield event.plain_result("你鉴图太频繁啦，歇一会儿再来。")
+                return
+            if not await self._quota.can_use(user_key):
+                yield event.plain_result("今天的鉴图次数用完啦，明天再来。")
+                return
 
         session = await self._get_session()
         max_bytes = self._config_int("max_image_mb", 8, 1, 50) * 1024 * 1024
@@ -142,7 +204,9 @@ class ImageJudgePlugin(Star):
                 continue
             normalized.append(image)
         if not normalized:
-            yield event.plain_result("图片下载失败或格式不支持，换个图试试？")
+            # 自动触发是插件主动搭话，失败保持沉默只记日志。
+            if not auto_mode:
+                yield event.plain_result("图片下载失败或格式不支持，换个图试试？")
             return
 
         style = self._detect_style(event.message_str or "")
@@ -150,17 +214,20 @@ class ImageJudgePlugin(Star):
             text = await self._call_llm(event, normalized, style)
         except Exception as exc:
             logger.exception("AI 鉴图：模型调用失败")
-            if bool(self.config.get("show_error_message", True)):
+            if not auto_mode and bool(self.config.get("show_error_message", True)):
                 yield event.plain_result(self._friendly_error(exc))
             return
         if not (text or "").strip():
-            yield event.plain_result("模型没有给出结果，再试一次？")
+            if not auto_mode:
+                yield event.plain_result("模型没有给出结果，再试一次？")
             return
 
         judgement = parse_judgement(text)
-        # 成功调用模型后才计时冷却、消耗配额。
-        await self._cooldown.mark(user_key)
-        await self._quota.consume(user_key)
+        # 成功调用模型后才计时冷却、消耗配额；自动触发只受概率与群冷却约束，
+        # 不消耗发图者的个人冷却与每日额度。
+        if not auto_mode:
+            await self._cooldown.mark(user_key)
+            await self._quota.consume(user_key)
 
         if not judgement.is_structured:
             yield event.plain_result((text or "").strip())
@@ -183,8 +250,86 @@ class ImageJudgePlugin(Star):
                 logger.exception("AI 鉴图：评分卡片渲染失败，降级为文本")
         yield event.plain_result(card_renderer.build_text_result(judgement, style))
 
+    async def _exec_admin_command(
+        self, event: AstrMessageEvent, command: AdminCommand
+    ):
+        group_id = self._group_id(event)
+        if not group_id:
+            yield event.plain_result("该指令仅在群聊中可用。")
+            return
+        if command.action == "状态":
+            yield event.plain_result(self._describe_group_status(group_id))
+            return
+        if not self._is_group_admin(event):
+            yield event.plain_result("只有群管理员或 Bot 管理员才能操作鉴图设置。")
+            return
+        try:
+            if command.action == "开启":
+                self._group_config.set(group_id, enabled=True)
+                message = "本群自动鉴图已开启。"
+                if not bool(self.config.get("enable_auto_trigger", False)):
+                    message += "注意：全局自动鉴图当前是关闭状态，需在 WebUI 配置中开启后才会生效。"
+                yield event.plain_result(message)
+                return
+            if command.action == "关闭":
+                self._group_config.set(group_id, enabled=False)
+                yield event.plain_result("本群自动鉴图已关闭，关键词触发不受影响。")
+                return
+            if command.value is None:
+                yield event.plain_result("用法：鉴图概率 0-100，如“鉴图概率 50”。")
+                return
+            if not 0 <= command.value <= 100:
+                yield event.plain_result("概率需要在 0-100 之间。")
+                return
+            self._group_config.set(group_id, probability=command.value)
+            yield event.plain_result(f"本群自动鉴图概率已设为 {command.value}%。")
+        except OSError:
+            logger.exception("AI 鉴图：保存群配置失败")
+            yield event.plain_result("保存设置失败，请查看 AstrBot 日志。")
+
+    def _describe_group_status(self, group_id: str) -> str:
+        settings = effective_settings(
+            global_enabled=bool(self.config.get("enable_auto_trigger", False)),
+            global_probability=self._config_int(
+                "auto_trigger_probability", 20, 0, 100
+            ),
+            override=self._group_config.get(group_id),
+        )
+        lines = [
+            f"自动鉴图（本群）：{'开启' if settings.enabled else '关闭'}",
+            f"触发概率：{settings.probability}%（{settings.probability_source}）",
+            f"触发冷却：{self._config_int('auto_trigger_cooldown_seconds', 300, 0, 86400)} 秒",
+            "发送“打分 / 鉴图”等关键词可随时手动触发。",
+        ]
+        return "\n".join(lines)
+
+    def _is_group_admin(self, event: AstrMessageEvent) -> bool:
+        """群主/群管理员，或 AstrBot 全局管理员（admins_id）。"""
+        sender_id = ""
+        try:
+            sender_id = event.get_sender_id() or ""
+        except Exception:
+            sender_id = ""
+        if sender_id:
+            try:
+                admins = self.context.get_config().get("admins_id", []) or []
+                if sender_id in admins:
+                    return True
+            except Exception:
+                pass
+        role = str(getattr(event, "role", "") or "")
+        if not role:
+            sender = getattr(event.message_obj, "sender", None)
+            role = str(getattr(sender, "role", "") or "")
+        if role:
+            return role.lower() in ("admin", "owner", "administrator")
+        try:
+            return bool(event.is_admin())
+        except Exception:
+            return False
+
     async def _collect_images(self, event: AstrMessageEvent) -> list[str]:
-        """收集待鉴图图片：优先当前消息中的图，其次被回复消息中的图。"""
+        """收集待鉴图图片：当前消息的图 → 被回复消息的图 → @目标的头像。"""
         refs: list[str] = []
         try:
             message_parts = event.get_messages()
@@ -201,7 +346,24 @@ class ImageJudgePlugin(Star):
                 refs.append(ref)
         if refs:
             return refs
-        return await self._collect_replied_image_refs(event, ignore_sticker)
+        refs = await self._collect_replied_image_refs(event, ignore_sticker)
+        if refs:
+            return refs
+        return self._avatar_refs(message_parts)
+
+    def _avatar_refs(self, message_parts) -> list[str]:
+        """“锐评 @某人”：把被 @ 的 QQ 号转成头像直链（主要支持 QQ 平台）。"""
+        if not bool(self.config.get("enable_avatar_judge", True)):
+            return []
+        refs: list[str] = []
+        for comp in message_parts or []:
+            if not isinstance(comp, Comp.At):
+                continue
+            qq = str(getattr(comp, "qq", "") or "").strip()
+            if not qq.isdigit():
+                continue  # 过滤 @全体成员 与非 QQ 平台的用户 ID
+            refs.append(qq_avatar_url(qq))
+        return refs
 
     async def _collect_replied_image_refs(
         self, event: AstrMessageEvent, ignore_sticker: bool
@@ -306,8 +468,13 @@ class ImageJudgePlugin(Star):
 
     @staticmethod
     def _image_ref(comp) -> str | None:
-        value = str(comp.file or comp.url or "").strip()
-        return value or None
+        # file 可能只是平台缓存文件名（无协议无路径），此时回退用 url。
+        file = str(getattr(comp, "file", "") or "").strip()
+        url = str(getattr(comp, "url", "") or "").strip()
+        for value in (file, url):
+            if value and is_plausible_image_ref(value):
+                return value
+        return file or url or None
 
     def _detect_style(self, text: str) -> str:
         match = self._style_re.search(text)

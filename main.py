@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import random
 import re
+import time
+from datetime import datetime
 from pathlib import Path
 
 import aiohttp
@@ -22,7 +24,12 @@ except ImportError:  # 兼容无 StarTools 的旧版本
 
 from .image_judge import prompts
 from .image_judge import renderer as card_renderer
-from .image_judge.admin import AdminCommand, parse_admin_command
+from .image_judge import trigger
+from .image_judge.admin import (
+    AdminCommand,
+    is_valid_board_scope,
+    parse_admin_command,
+)
 from .image_judge.cooldown import DailyQuota, UserCooldown
 from .image_judge.group_config import GroupConfigStore, effective_settings
 from .image_judge.image_utils import (
@@ -33,6 +40,7 @@ from .image_judge.image_utils import (
     qq_avatar_url,
 )
 from .image_judge.judge import parse_judgement
+from .image_judge.leaderboard import JudgeRecord, LeaderboardStore
 
 
 class ImageJudgePlugin(Star):
@@ -61,6 +69,9 @@ class ImageJudgePlugin(Star):
         self._quota = DailyQuota(self._config_int("daily_limit", 20, 0, 10000))
         self._group_config = GroupConfigStore(
             self._data_dir() / "group_config.json"
+        )
+        self._leaderboard = LeaderboardStore(
+            self._data_dir() / "leaderboard.json"
         )
 
     @staticmethod
@@ -115,7 +126,19 @@ class ImageJudgePlugin(Star):
         if not bool(self.config.get("private_enable", True)) and not self._group_id(event):
             return False, False
         if self._keywords_re.search(text):
-            return True, False
+            # “评价 / 点评”这类触发词常出现在普通聊天里（如“帮我评价一下这个
+            # 方案”），误触发既打扰群聊，又会 stop_event 拦截主 agent 处理这条
+            # 消息。有图片上下文（当前消息带图 / 回复 / @目标）才立即触发；
+            # 否则要求消息基本就是一条鉴图指令。
+            if (
+                self._may_carry_image(event)
+                or self._avatar_refs(self._message_parts(event))
+                or trigger.is_command_like(
+                    text, self._keywords_re, self._style_re, self._theme_re
+                )
+            ):
+                return True, False
+            return False, False
 
         if not bool(self.config.get("enable_auto_trigger", False)):
             return False, False
@@ -145,12 +168,16 @@ class ImageJudgePlugin(Star):
             return False, False
         return True, True
 
+    @staticmethod
+    def _message_parts(event: AstrMessageEvent) -> list:
+        try:
+            return event.get_messages()
+        except (AttributeError, TypeError):
+            return []
+
     def _may_carry_image(self, event: AstrMessageEvent) -> bool:
         """轻量判断消息是否可能带图：含图片组件（跳过表情包）或回复组件。"""
-        try:
-            message_parts = event.get_messages()
-        except (AttributeError, TypeError):
-            message_parts = []
+        message_parts = self._message_parts(event)
         ignore_sticker = bool(self.config.get("ignore_sticker", True))
         has_reply = False
         for comp in message_parts:
@@ -229,6 +256,22 @@ class ImageJudgePlugin(Star):
             await self._cooldown.mark(user_key)
             await self._quota.consume(user_key)
 
+        group_id = self._group_id(event)
+        if judgement.score is not None and group_id:
+            # 排行榜记录失败不影响鉴图结果本身。
+            try:
+                self._leaderboard.add(
+                    group_id,
+                    JudgeRecord(
+                        score=judgement.score,
+                        subject_id=self._subject_id(event),
+                        ts=time.time(),
+                        reason=judgement.reason,
+                    ),
+                )
+            except OSError:
+                logger.exception("AI 鉴图：保存排行榜记录失败")
+
         if not judgement.is_structured:
             yield event.plain_result((text or "").strip())
             return
@@ -260,6 +303,14 @@ class ImageJudgePlugin(Star):
         if command.action == "状态":
             yield event.plain_result(self._describe_group_status(group_id))
             return
+        if command.action == "榜":
+            if not is_valid_board_scope(command.scope):
+                yield event.plain_result("用法：鉴图榜 [今日 / 本周 / 总]。")
+                return
+            yield event.plain_result(
+                self._render_leaderboard(group_id, command.scope)
+            )
+            return
         if not self._is_group_admin(event):
             yield event.plain_result("只有群管理员或 Bot 管理员才能操作鉴图设置。")
             return
@@ -274,6 +325,9 @@ class ImageJudgePlugin(Star):
             if command.action == "关闭":
                 self._group_config.set(group_id, enabled=False)
                 yield event.plain_result("本群自动鉴图已关闭，关键词触发不受影响。")
+                return
+            if command.invalid:
+                yield event.plain_result("用法：鉴图概率 0-100（纯数字），如“鉴图概率 50”。")
                 return
             if command.value is None:
                 yield event.plain_result("用法：鉴图概率 0-100，如“鉴图概率 50”。")
@@ -303,6 +357,58 @@ class ImageJudgePlugin(Star):
         ]
         return "\n".join(lines)
 
+    def _render_leaderboard(self, group_id: str, scope: str) -> str:
+        """渲染“鉴图榜”文本：scope = today / week / all。"""
+        if scope == "week":
+            since = time.time() - 7 * 86400
+            title = "本周"
+        elif scope == "all":
+            since = None
+            title = "总榜"
+        else:
+            since = datetime.now().replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).timestamp()
+            title = "今日"
+        records = self._leaderboard.top(group_id, since=since, limit=5)
+        if not records:
+            return f"本群{title}还没有鉴图记录，发张图配“打分”试试。"
+        lines = [f"本群鉴图榜（{title}）"]
+        for rank, record in enumerate(records, 1):
+            entry = f"{rank}. {record.score} 分 — {record.subject_id}"
+            if record.reason:
+                entry += f"：{self._clip(record.reason, 30)}"
+            lines.append(entry)
+        if len(records) >= 3:
+            worst = self._leaderboard.worst(group_id, since=since)
+            if worst is not None and worst.score < records[-1].score:
+                lines.append(f"最惨：{worst.subject_id} {worst.score} 分")
+        return "\n".join(lines)
+
+    def _subject_id(self, event: AstrMessageEvent) -> str:
+        """受评者：被回复消息的发送者 > 被 @ 的用户 > 当前发送者。"""
+        first_at = ""
+        for comp in self._message_parts(event):
+            if isinstance(comp, Comp.Reply):
+                reply_sender = str(getattr(comp, "sender_id", "") or "").strip()
+                if reply_sender:
+                    return reply_sender
+            if not first_at and isinstance(comp, Comp.At):
+                qq = str(getattr(comp, "qq", "") or "").strip()
+                if qq.isdigit():
+                    first_at = qq
+        if first_at:
+            return first_at
+        try:
+            return event.get_sender_id() or "unknown"
+        except Exception:
+            return "unknown"
+
+    @staticmethod
+    def _clip(text: str, limit: int) -> str:
+        text = (text or "").strip()
+        return text if len(text) <= limit else text[: limit - 1] + "…"
+
     def _is_group_admin(self, event: AstrMessageEvent) -> bool:
         """群主/群管理员，或 AstrBot 全局管理员（admins_id）。"""
         sender_id = ""
@@ -331,10 +437,7 @@ class ImageJudgePlugin(Star):
     async def _collect_images(self, event: AstrMessageEvent) -> list[str]:
         """收集待鉴图图片：当前消息的图 → 被回复消息的图 → @目标的头像。"""
         refs: list[str] = []
-        try:
-            message_parts = event.get_messages()
-        except (AttributeError, TypeError):
-            message_parts = []
+        message_parts = self._message_parts(event)
         ignore_sticker = bool(self.config.get("ignore_sticker", True))
         for comp in message_parts:
             if not isinstance(comp, Comp.Image):
@@ -376,26 +479,24 @@ class ImageJudgePlugin(Star):
         2. 部分平台会把被回复消息内嵌进 reply 段的原始 JSON，递归挖掘；
         3. 兜底：手动调用 OneBot get_msg 动作（仅 OneBot 适配器可用）。
         """
+        message_parts = self._message_parts(event)
         reply = None
-        try:
-            message_parts = event.get_messages()
-        except (AttributeError, TypeError):
-            message_parts = []
         for comp in message_parts:
             if isinstance(comp, Comp.Reply):
                 reply = comp
                 break
-        if reply is not None:
-            refs = self._image_refs_from_chain(reply.chain, ignore_sticker)
-            if refs:
-                return refs
+        if reply is None:
+            return []
+        refs = self._image_refs_from_chain(reply.chain, ignore_sticker)
+        if refs:
+            return refs
 
+        # 仅在存在回复时才扫原始消息 JSON：无回复时 raw_message 只含当前
+        # 消息文本，扫它会把用户手打的任意 URL 也下载下来。
         refs = extract_image_urls(getattr(event.message_obj, "raw_message", None))
         if refs:
             return refs
 
-        if reply is None:
-            return []
         message_id = getattr(reply, "id", None)
         if message_id in (None, ""):
             return []

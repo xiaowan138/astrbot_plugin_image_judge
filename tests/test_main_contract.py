@@ -10,6 +10,47 @@ def main_source() -> str:
 
 
 class MainHandlerContractTests(unittest.TestCase):
+    def test_keyword_trigger_requires_command_like_intent_without_image(self):
+        # 触发词出现在普通聊天里（如“帮我评价一下这个方案”）不应劫持消息：
+        # 无图片上下文时必须经过 is_command_like 判定。
+        source = main_source()
+        self.assertIn("trigger.is_command_like(", source)
+        keyword_line = source.index("self._keywords_re.search(text)")
+        intent_line = source.index("trigger.is_command_like(")
+        self.assertLess(keyword_line, intent_line)
+        self.assertIn("self._avatar_refs(self._message_parts(event))", source)
+
+    def test_raw_message_urls_only_mined_when_reply_exists(self):
+        # 无回复时 raw_message 只含当前消息文本，扫它会误下载用户手打的 URL。
+        source = main_source()
+        no_reply_line = source.index("if reply is None:")
+        extract_line = source.index("extract_image_urls(getattr(event.message_obj, \"raw_message\"")
+        self.assertLess(no_reply_line, extract_line)
+
+    def test_invalid_probability_gets_usage_hint(self):
+        source = main_source()
+        self.assertIn("if command.invalid:", source)
+        self.assertIn("鉴图概率 0-100（纯数字）", source)
+
+    def test_leaderboard_is_recorded_and_queryable(self):
+        source = main_source()
+        self.assertIn("LeaderboardStore(", source)
+        self.assertIn("leaderboard.json", source)
+        self.assertIn("JudgeRecord(", source)
+        self.assertIn("self._leaderboard.add(", source)
+        self.assertIn("self._render_leaderboard(group_id, command.scope)", source)
+        self.assertIn("is_valid_board_scope(command.scope)", source)
+        self.assertIn("鉴图榜", source)
+        # 只有解析出分数且在群聊中才记录。
+        self.assertIn("if judgement.score is not None and group_id:", source)
+
+    def test_board_command_is_available_to_everyone(self):
+        source = main_source()
+        board_line = source.index('command.action == "榜"')
+        admin_gate_line = source.index("if not self._is_group_admin(event):")
+        # 榜与状态一样，所有人可查，应在管理员校验之前返回。
+        self.assertLess(board_line, admin_gate_line)
+
     def test_event_is_stopped_only_after_all_yielded_results(self):
         tree = ast.parse(main_source())
         handler = next(

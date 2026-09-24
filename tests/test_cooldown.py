@@ -2,7 +2,7 @@ import asyncio
 import unittest
 from datetime import date
 
-from image_judge.cooldown import DailyQuota, UserCooldown
+from image_judge.cooldown import DailyQuota, HourlyCap, UserCooldown
 
 
 class UserCooldownTests(unittest.TestCase):
@@ -32,6 +32,47 @@ class UserCooldownTests(unittest.TestCase):
         cooldown = UserCooldown(60)
         asyncio.run(cooldown.mark("user-1"))
         self.assertTrue(asyncio.run(cooldown.is_ok("user-2")))
+
+
+class HourlyCapTests(unittest.TestCase):
+    def test_zero_limit_disables_cap(self):
+        cap = HourlyCap(0)
+        self.assertFalse(cap.enabled)
+        for _ in range(50):
+            asyncio.run(cap.mark("g"))
+        self.assertTrue(asyncio.run(cap.is_ok("g")))
+
+    def test_allows_until_limit_within_window(self):
+        cap = HourlyCap(3, window_seconds=3600)
+        for _ in range(3):
+            self.assertTrue(asyncio.run(cap.is_ok("g")))
+            asyncio.run(cap.mark("g"))
+        self.assertFalse(asyncio.run(cap.is_ok("g")))
+
+    def test_is_ok_does_not_consume(self):
+        cap = HourlyCap(1, window_seconds=3600)
+        for _ in range(5):
+            self.assertTrue(asyncio.run(cap.is_ok("g")))
+        asyncio.run(cap.mark("g"))
+        self.assertFalse(asyncio.run(cap.is_ok("g")))
+
+    def test_window_slides(self):
+        clock = {"now": 0.0}
+        cap = HourlyCap(1, window_seconds=3600, clock=lambda: clock["now"])
+        asyncio.run(cap.mark("g"))
+        self.assertFalse(asyncio.run(cap.is_ok("g")))
+        clock["now"] = 3600.0
+        self.assertTrue(asyncio.run(cap.is_ok("g")))
+
+    def test_keys_are_independent(self):
+        cap = HourlyCap(1, window_seconds=3600)
+        asyncio.run(cap.mark("g1"))
+        self.assertFalse(asyncio.run(cap.is_ok("g1")))
+        self.assertTrue(asyncio.run(cap.is_ok("g2")))
+
+    def test_negative_limit_is_clamped_to_disabled(self):
+        cap = HourlyCap(-5)
+        self.assertFalse(cap.enabled)
 
 
 class DailyQuotaTests(unittest.TestCase):

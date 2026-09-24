@@ -49,6 +49,14 @@ class JudgeRecord:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class SubjectStats:
+    count: int
+    average: float
+    best: int
+    worst: int
+
+
 class LeaderboardStore:
     def __init__(self, path: Path, *, max_per_group: int = 500) -> None:
         self._path = Path(path)
@@ -132,3 +140,22 @@ class LeaderboardStore:
         if not records:
             return None
         return min(records, key=lambda record: (record.score, -record.ts))
+
+    def stats(
+        self, group_id: str, subject_id: str, *, since: float | None = None
+    ) -> SubjectStats | None:
+        """某个受评者在时间窗口内的战绩；没有记录返回 None。"""
+        wanted = str(subject_id)
+        scores = [
+            record.score
+            for record in self._window(group_id, since)
+            if record.subject_id == wanted
+        ]
+        if not scores:
+            return None
+        return SubjectStats(
+            count=len(scores),
+            average=sum(scores) / len(scores),
+            best=max(scores),
+            worst=min(scores),
+        )

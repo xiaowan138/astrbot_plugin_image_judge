@@ -4,6 +4,7 @@ import io
 import unittest
 
 from image_judge.image_utils import (
+    _DOWNLOAD_CHUNK_BYTES,
     _bytes_to_data_url,
     _compress_for_provider,
     _mime_from_magic,
@@ -33,11 +34,64 @@ def make_jpeg_bytes() -> bytes:
     return buffer.getvalue()
 
 
+class FakeContent:
+    """最小 aiohttp StreamReader 假对象，支持分块读取并记录消费量。"""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self.consumed = 0
+
+    async def iter_chunked(self, size: int):
+        for start in range(0, len(self._data), size):
+            chunk = self._data[start : start + size]
+            self.consumed += len(chunk)
+            yield chunk
+
+
+class FakeResponse:
+    def __init__(self, data: bytes, *, content_length: int | None = None) -> None:
+        self._data = data
+        self.status = 200
+        self.content = FakeContent(data)
+        self.content_length = content_length
+
+    async def read(self):
+        return self._data
+
+
+class FakeRequest:
+    def __init__(self, url: str, *, content_length: int | None = None) -> None:
+        self._url = url
+        self._content_length = content_length
+
+    async def __aenter__(self):
+        lowered = self._url.lower()
+        if ".big" in lowered:
+            # 魔数正确但体积巨大的图片，用来验证边下边限流。
+            data = make_png_bytes() + b"\x00" * (512 * 1024)
+        elif ".png" in lowered:
+            data = make_png_bytes()
+        elif ".gif" in lowered:
+            data = make_gif_bytes()
+        else:
+            data = b"not an image"
+        return FakeResponse(data, content_length=self._content_length)
+
+    async def __aexit__(self, *args):
+        return False
+
+
 class FakeSession:
     """最小 aiohttp 假对象：get 返回可 async with 的请求对象（同真实 aiohttp）。"""
 
+    def __init__(self, *, content_length: int | None = None) -> None:
+        self._content_length = content_length
+        self.last_response: FakeResponse | None = None
+
     def get(self, url, *, headers=None, timeout=None):
-        return FakeRequest(url)
+        request = FakeRequest(url, content_length=self._content_length)
+        self.last_response = request
+        return _RecordingRequest(request, self)
 
     async def __aenter__(self):
         return self
@@ -46,31 +100,18 @@ class FakeSession:
         return False
 
 
-class FakeRequest:
-    def __init__(self, url):
-        self._url = url
+class _RecordingRequest:
+    def __init__(self, request: FakeRequest, session: FakeSession) -> None:
+        self._request = request
+        self._session = session
 
     async def __aenter__(self):
-        lowered = self._url.lower()
-        if ".png" in lowered:
-            data = make_png_bytes()
-        elif ".gif" in lowered:
-            data = make_gif_bytes()
-        else:
-            data = b"not an image"
-        return FakeResponse(data)
+        response = await self._request.__aenter__()
+        self._session.last_response = response
+        return response
 
     async def __aexit__(self, *args):
         return False
-
-
-class FakeResponse:
-    def __init__(self, data):
-        self._data = data
-        self.status = 200
-
-    async def read(self):
-        return self._data
 
 
 class MagicMimeTests(unittest.TestCase):
@@ -154,6 +195,52 @@ class NormalizeTests(unittest.TestCase):
                 )
             )
         )
+
+
+class DownloadLimitTests(unittest.TestCase):
+    """下载必须在读取过程中限流，不能读完再判断大小。"""
+
+    def test_oversized_download_aborts_before_reading_all(self):
+        session = FakeSession()
+        normalized = asyncio.run(
+            normalize_image_ref(
+                "https://example.com/a/photo.big",
+                session,
+                max_bytes=128 * 1024,
+                timeout_seconds=5,
+            )
+        )
+        self.assertIsNone(normalized)
+        consumed = session.last_response.content.consumed
+        total = len(session.last_response._data)
+        self.assertLess(consumed, total)
+        # 读取以整块为单位，最多超出上限一块，绝不能把 512KB 全读进来。
+        self.assertLessEqual(consumed, 128 * 1024 + _DOWNLOAD_CHUNK_BYTES)
+
+    def test_declared_length_over_cap_skips_body(self):
+        session = FakeSession(content_length=64 * 1024 * 1024)
+        normalized = asyncio.run(
+            normalize_image_ref(
+                "https://example.com/a/photo.big",
+                session,
+                max_bytes=1024 * 1024,
+                timeout_seconds=5,
+            )
+        )
+        self.assertIsNone(normalized)
+        self.assertEqual(session.last_response.content.consumed, 0)
+
+    def test_within_cap_download_succeeds(self):
+        session = FakeSession()
+        normalized = asyncio.run(
+            normalize_image_ref(
+                "https://example.com/a/image.png",
+                session,
+                max_bytes=8 * 1024 * 1024,
+                timeout_seconds=5,
+            )
+        )
+        self.assertIsNotNone(normalized)
 
 
 class DataUriNormalizeTests(unittest.TestCase):

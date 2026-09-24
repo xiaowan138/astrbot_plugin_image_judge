@@ -50,6 +50,65 @@ class UserCooldown:
             self._marks.pop(oldest, None)
 
 
+class HourlyCap:
+    """滑动窗口次数上限（群级自动触发防刷屏用）。
+
+    与 ``UserCooldown`` 一样区分 ``is_ok``（只判断）与 ``mark``（计数），
+    这样取图失败时不会白白占掉配额。
+    """
+
+    def __init__(
+        self,
+        limit: int,
+        *,
+        window_seconds: float = 3600.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.limit = max(int(limit), 0)
+        self.window_seconds = max(float(window_seconds), 1.0)
+        self._clock = clock
+        self._marks: dict[str, list[float]] = {}
+        self._lock = asyncio.Lock()
+
+    @property
+    def enabled(self) -> bool:
+        return self.limit > 0
+
+    async def is_ok(self, key: str) -> bool:
+        """窗口内是否还有余量；不消耗配额。"""
+        if not self.enabled:
+            return True
+        now = self._clock()
+        async with self._lock:
+            recent = self._recent(key, now)
+            self._marks[key] = recent
+            return len(recent) < self.limit
+
+    async def mark(self, key: str) -> None:
+        now = self._clock()
+        if not self.enabled:
+            return
+        async with self._lock:
+            recent = self._recent(key, now)
+            recent.append(now)
+            self._marks[key] = recent
+            self._prune(now)
+
+    def _recent(self, key: str, now: float) -> list[float]:
+        cutoff = now - self.window_seconds
+        return [ts for ts in self._marks.get(key, []) if ts > cutoff]
+
+    def _prune(self, now: float) -> None:
+        if len(self._marks) <= 1024:
+            return
+        self._marks = {key: self._recent(key, now) for key in self._marks}
+        while len(self._marks) > 1024:
+            oldest = min(
+                self._marks, key=lambda key: max(self._marks[key], default=0.0)
+            )
+            self._marks.pop(oldest, None)
+
+
 class DailyQuota:
     def __init__(self, limit: int) -> None:
         self.limit = max(int(limit), 0)

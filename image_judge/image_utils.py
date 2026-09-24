@@ -34,6 +34,9 @@ DEFAULT_USER_AGENT = (
 
 _PLAUSIBLE_REF_PREFIXES = ("http://", "https://", "data:", "base64://", "file://")
 
+#: 下载分块大小；边下边累计体积，超限立刻停止读取。
+_DOWNLOAD_CHUNK_BYTES = 64 * 1024
+
 
 def is_plausible_image_ref(value: str) -> bool:
     """引用是否是可直接解析的形态（URL/data URI/base64/本地路径）。
@@ -53,7 +56,6 @@ def qq_avatar_url(qq: str, size: int = 640) -> str:
 @dataclass(frozen=True, slots=True)
 class NormalizedImage:
     data_url: str
-    mime: str
     is_gif: bool
 
 
@@ -113,13 +115,34 @@ def _gif_first_frame_as_png(data: bytes) -> bytes:
         return data
 
 
-async def _download(url: str, session: aiohttp.ClientSession, timeout_seconds: float) -> bytes | None:
+async def _download(
+    url: str,
+    session: aiohttp.ClientSession,
+    timeout_seconds: float,
+    max_bytes: int,
+) -> bytes | None:
+    """下载图片，边下边累计体积，超限立即中断。
+
+    不能用 ``response.read()`` 一次性读完再判断大小：那样子限只在读完之后
+    才生效，指向超大文件（或恶意 URL）的响应会先把内容全读进内存。
+    """
     try:
         headers = {"User-Agent": DEFAULT_USER_AGENT, "Referer": _referer_for(url)}
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout_seconds)) as response:
+        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        async with session.get(url, headers=headers, timeout=timeout) as response:
             if response.status != 200:
                 return None
-            return await response.read()
+            declared = response.content_length
+            if declared is not None and declared > max_bytes:
+                return None
+            chunks: list[bytes] = []
+            size = 0
+            async for chunk in response.content.iter_chunked(_DOWNLOAD_CHUNK_BYTES):
+                size += len(chunk)
+                if size > max_bytes:
+                    return None
+                chunks.append(chunk)
+            return b"".join(chunks)
     except (aiohttp.ClientError, asyncio.TimeoutError):
         return None
 
@@ -159,7 +182,7 @@ async def normalize_image_ref(
         except (ValueError, TypeError):
             return None
     elif _HTTP_URL_RE.match(value):
-        raw = await _download(value, session, timeout_seconds)
+        raw = await _download(value, session, timeout_seconds, max_bytes)
         if raw is None:
             return None
     else:
@@ -184,12 +207,14 @@ async def normalize_image_ref(
     is_gif = mime == "image/gif"
     if is_gif and first_frame_gif:
         raw = _gif_first_frame_as_png(raw)
-        mime = "image/png"
 
     compressed = _compress_for_provider(raw)
     if len(compressed) > max_bytes:
         return None
-    return NormalizedImage(_bytes_to_data_url(compressed, "image/jpeg"), mime, is_gif)
+    # 压缩失败时 _compress_for_provider 原样返回原始字节，MIME 必须按实际内容
+    # 判断，不能固定写 jpeg（否则 data URL 声明与内容不符，严格的网关会拒收）。
+    final_mime = _mime_from_magic(compressed) or "image/jpeg"
+    return NormalizedImage(_bytes_to_data_url(compressed, final_mime), is_gif)
 
 
 def _iter_strings(value: Any, *, depth: int = 0, seen: set[int] | None = None) -> Iterator[str]:

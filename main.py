@@ -22,7 +22,9 @@ except ImportError:  # 兼容无 StarTools 的旧版本
     except ImportError:
         StarTools = None
 
+from .image_judge import cache as result_cache
 from .image_judge import prompts
+from .image_judge import quiet_hours
 from .image_judge import renderer as card_renderer
 from .image_judge import trigger
 from .image_judge.admin import (
@@ -30,7 +32,8 @@ from .image_judge.admin import (
     is_valid_board_scope,
     parse_admin_command,
 )
-from .image_judge.cooldown import DailyQuota, UserCooldown
+from .image_judge.cache import ResultCache
+from .image_judge.cooldown import DailyQuota, HourlyCap, UserCooldown
 from .image_judge.group_config import GroupConfigStore, effective_settings
 from .image_judge.image_utils import (
     DEFAULT_USER_AGENT,
@@ -67,6 +70,12 @@ class ImageJudgePlugin(Star):
             self._config_int("auto_trigger_cooldown_seconds", 300, 0, 86400)
         )
         self._quota = DailyQuota(self._config_int("daily_limit", 20, 0, 10000))
+        self._group_hourly = HourlyCap(
+            self._config_int("group_hourly_limit", 0, 0, 10000)
+        )
+        self._result_cache = ResultCache(
+            self._config_int("result_cache_seconds", 600, 0, 86400)
+        )
         self._group_config = GroupConfigStore(
             self._data_dir() / "group_config.json"
         )
@@ -145,6 +154,9 @@ class ImageJudgePlugin(Star):
         group_id = self._group_id(event)
         if not group_id:
             return False, False
+        # 免打扰时段只拦自动触发；关键词触发是用户主动发起，任何时段都响应。
+        if quiet_hours.is_quiet_now(str(self.config.get("quiet_hours", "") or "")):
+            return False, False
         allowlist = str(self.config.get("group_allowlist", "") or "").strip()
         if allowlist:
             allowed = {g.strip() for g in allowlist.split(",") if g.strip()}
@@ -165,6 +177,8 @@ class ImageJudgePlugin(Star):
         if settings.probability <= 0 or random.randint(1, 100) > settings.probability:
             return False, False
         if not await self._auto_cooldown.is_ok(f"group\x1f{group_id}"):
+            return False, False
+        if not await self._group_hourly.is_ok(f"group\x1f{group_id}"):
             return False, False
         return True, True
 
@@ -199,10 +213,11 @@ class ImageJudgePlugin(Star):
             yield event.plain_result("请回复一张图片（或直接发图），再发送“打分”触发鉴图。")
             return
         if auto_mode:
-            # 确认有图才消耗群冷却，纯文本不烧掉自动触发机会。
+            # 确认有图才消耗群冷却与每小时配额，纯文本不烧掉自动触发机会。
             group_id = self._group_id(event)
             if group_id:
                 await self._auto_cooldown.mark(f"group\x1f{group_id}")
+                await self._group_hourly.mark(f"group\x1f{group_id}")
 
         user_key = self._user_key(event)
         if not auto_mode:
@@ -237,13 +252,18 @@ class ImageJudgePlugin(Star):
             return
 
         style = self._detect_style(event.message_str or "")
-        try:
-            text = await self._call_llm(event, normalized, style)
-        except Exception as exc:
-            logger.exception("AI 鉴图：模型调用失败")
-            if not auto_mode and bool(self.config.get("show_error_message", True)):
-                yield event.plain_result(self._friendly_error(exc))
-            return
+        # 同一张图（内容相同）在有效期内直接复用上次的模型输出，省额度。
+        key = result_cache.cache_key(normalized[0].data_url, style)
+        text = self._result_cache.get(key)
+        if text is None:
+            try:
+                text = await self._call_llm(event, normalized, style)
+            except Exception as exc:
+                logger.exception("AI 鉴图：模型调用失败")
+                if not auto_mode and bool(self.config.get("show_error_message", True)):
+                    yield event.plain_result(self._friendly_error(exc))
+                return
+            self._result_cache.put(key, text)
         if not (text or "").strip():
             if not auto_mode:
                 yield event.plain_result("模型没有给出结果，再试一次？")
@@ -304,11 +324,30 @@ class ImageJudgePlugin(Star):
             yield event.plain_result(self._describe_group_status(group_id))
             return
         if command.action == "榜":
+            target = self._at_user_id(event)
+            if target:
+                # 平台可能把 @某人 渲染成不带 @ 的昵称，此时范围词解析不出来，
+                # 回退到今日而不是报错。
+                yield event.plain_result(
+                    self._render_subject_stats(group_id, target, command.scope or "today")
+                )
+                return
             if not is_valid_board_scope(command.scope):
-                yield event.plain_result("用法：鉴图榜 [今日 / 本周 / 总]。")
+                yield event.plain_result("用法：鉴图榜 [今日 / 本周 / 总]，也可“鉴图榜 @某人”查个人战绩。")
                 return
             yield event.plain_result(
                 self._render_leaderboard(group_id, command.scope)
+            )
+            return
+        if command.action == "我的":
+            scope = command.scope or "today"
+            if not is_valid_board_scope(scope):
+                yield event.plain_result("用法：我的鉴图 [今日 / 本周 / 总]。")
+                return
+            yield event.plain_result(
+                self._render_subject_stats(
+                    group_id, self._subject_id(event), scope
+                )
             )
             return
         if not self._is_group_admin(event):
@@ -353,23 +392,27 @@ class ImageJudgePlugin(Star):
             f"自动鉴图（本群）：{'开启' if settings.enabled else '关闭'}",
             f"触发概率：{settings.probability}%（{settings.probability_source}）",
             f"触发冷却：{self._config_int('auto_trigger_cooldown_seconds', 300, 0, 86400)} 秒",
-            "发送“打分 / 鉴图”等关键词可随时手动触发。",
         ]
+        hourly = self._config_int("group_hourly_limit", 0, 0, 10000)
+        lines.append(f"每小时上限：{hourly} 次" if hourly > 0 else "每小时上限：不限")
+        quiet = str(self.config.get("quiet_hours", "") or "").strip()
+        lines.append(f"免打扰时段：{quiet}" if quiet else "免打扰时段：未设置")
+        lines.append("发送“打分 / 鉴图”等关键词可随时手动触发。")
         return "\n".join(lines)
+
+    @staticmethod
+    def _board_window(scope: str) -> tuple[float | None, str]:
+        """把范围标识换成 (起始时间戳, 展示名)；总榜起始为 None。"""
+        if scope == "week":
+            return time.time() - 7 * 86400, "本周"
+        if scope == "all":
+            return None, "总榜"
+        midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        return midnight.timestamp(), "今日"
 
     def _render_leaderboard(self, group_id: str, scope: str) -> str:
         """渲染“鉴图榜”文本：scope = today / week / all。"""
-        if scope == "week":
-            since = time.time() - 7 * 86400
-            title = "本周"
-        elif scope == "all":
-            since = None
-            title = "总榜"
-        else:
-            since = datetime.now().replace(
-                hour=0, minute=0, second=0, microsecond=0
-            ).timestamp()
-            title = "今日"
+        since, title = self._board_window(scope)
         records = self._leaderboard.top(group_id, since=since, limit=5)
         if not records:
             return f"本群{title}还没有鉴图记录，发张图配“打分”试试。"
@@ -385,20 +428,40 @@ class ImageJudgePlugin(Star):
                 lines.append(f"最惨：{worst.subject_id} {worst.score} 分")
         return "\n".join(lines)
 
+    def _render_subject_stats(self, group_id: str, subject_id: str, scope: str) -> str:
+        """渲染某人的个人战绩（鉴图榜 @某人 / 我的鉴图）。"""
+        since, title = self._board_window(scope)
+        stats = self._leaderboard.stats(group_id, subject_id, since=since)
+        if stats is None:
+            return f"{subject_id} 在{title}还没有鉴图记录。"
+        return "\n".join(
+            [
+                f"{subject_id} 的鉴图战绩（{title}）",
+                f"被评 {stats.count} 次 · 平均 {stats.average:.1f} 分",
+                f"最高 {stats.best} 分 · 最低 {stats.worst} 分",
+            ]
+        )
+
+    def _at_user_id(self, event: AstrMessageEvent) -> str | None:
+        """消息里第一个被 @ 的 QQ 号；@全体成员 与非 QQ 平台 ID 会被跳过。"""
+        for comp in self._message_parts(event):
+            if not isinstance(comp, Comp.At):
+                continue
+            qq = str(getattr(comp, "qq", "") or "").strip()
+            if qq.isdigit():
+                return qq
+        return None
+
     def _subject_id(self, event: AstrMessageEvent) -> str:
         """受评者：被回复消息的发送者 > 被 @ 的用户 > 当前发送者。"""
-        first_at = ""
         for comp in self._message_parts(event):
             if isinstance(comp, Comp.Reply):
                 reply_sender = str(getattr(comp, "sender_id", "") or "").strip()
                 if reply_sender:
                     return reply_sender
-            if not first_at and isinstance(comp, Comp.At):
-                qq = str(getattr(comp, "qq", "") or "").strip()
-                if qq.isdigit():
-                    first_at = qq
-        if first_at:
-            return first_at
+        at_id = self._at_user_id(event)
+        if at_id:
+            return at_id
         try:
             return event.get_sender_id() or "unknown"
         except Exception:

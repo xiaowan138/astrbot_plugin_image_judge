@@ -20,6 +20,17 @@ class ParseAdminCommandTests(unittest.TestCase):
     def test_whitespace_is_tolerated(self):
         self.assertEqual(parse_admin_command("  鉴图开启 \n"), command("开启"))
 
+    def test_space_between_words_is_tolerated(self):
+        # 中文输入法常在词间加空格，不能因此把指令当成普通消息。
+        self.assertEqual(parse_admin_command("鉴图 开启"), command("开启"))
+        self.assertEqual(parse_admin_command("鉴图 关闭"), command("关闭"))
+        self.assertEqual(parse_admin_command("鉴图 状态"), command("状态"))
+        self.assertEqual(parse_admin_command("鉴图 概率 50"), command("概率", 50))
+        self.assertEqual(parse_admin_command("鉴图 榜"), command("榜", scope="today"))
+        self.assertEqual(
+            parse_admin_command("鉴图  概率   30"), command("概率", 30)
+        )
+
     def test_probability_with_value(self):
         self.assertEqual(parse_admin_command("鉴图概率 50"), command("概率", 50))
         self.assertEqual(parse_admin_command("鉴图概率  0"), command("概率", 0))
@@ -56,18 +67,42 @@ class ParseAdminCommandTests(unittest.TestCase):
         self.assertEqual(parse_admin_command("鉴图榜 总"), command("榜", scope="all"))
         self.assertEqual(parse_admin_command("鉴图榜 历史"), command("榜", scope="all"))
 
-    def test_board_unknown_scope_is_passed_through(self):
-        # 未知范围词原样透传，由 main 给出用法提示。
+    def test_board_with_mention_keeps_scope(self):
+        # @提及会被部分平台渲染进 message_str，范围词仍要能解析出来。
         self.assertEqual(
-            parse_admin_command("鉴图榜 明年"), command("榜", scope="明年")
+            parse_admin_command("鉴图榜 @张三"), command("榜", scope="today")
         )
-        self.assertFalse(is_valid_board_scope("明年"))
+        self.assertEqual(
+            parse_admin_command("鉴图榜 @张三 本周"), command("榜", scope="week")
+        )
+        self.assertEqual(
+            parse_admin_command("鉴图榜 @张三 总"), command("榜", scope="all")
+        )
+
+    def test_board_unknown_scope_yields_empty_scope(self):
+        # 空 scope 表示无法识别，由 main 决定是提示用法还是回退今日。
+        self.assertEqual(parse_admin_command("鉴图榜 明年"), command("榜", scope=""))
+        self.assertFalse(is_valid_board_scope(""))
 
     def test_board_scope_validation(self):
         for scope in ("today", "week", "all"):
             self.assertTrue(is_valid_board_scope(scope))
         for scope in ("", "昨日", "月"):
             self.assertFalse(is_valid_board_scope(scope))
+
+    def test_mine_command(self):
+        self.assertEqual(parse_admin_command("我的鉴图"), command("我的", scope="today"))
+        self.assertEqual(parse_admin_command("我的战绩"), command("我的", scope="today"))
+        self.assertEqual(parse_admin_command("我的 鉴定"), command("我的", scope="today"))
+        self.assertEqual(
+            parse_admin_command("我的鉴图 本周"), command("我的", scope="week")
+        )
+        self.assertEqual(
+            parse_admin_command("我的 战绩 总"), command("我的", scope="all")
+        )
+
+    def test_mine_unknown_scope_yields_empty_scope(self):
+        self.assertEqual(parse_admin_command("我的鉴图 上周"), command("我的", scope=""))
 
     def test_non_commands_return_none(self):
         for text in (
@@ -78,6 +113,8 @@ class ParseAdminCommandTests(unittest.TestCase):
             "鉴图开启一下呗",
             "开启鉴图",
             "/鉴图开启",
+            "我的天啊",
+            "我的图呢",
         ):
             self.assertIsNone(parse_admin_command(text), text)
 

@@ -121,5 +121,48 @@ class LeaderboardStoreTests(unittest.TestCase):
         self.assertEqual([r.score for r in top], [4, 3, 2])
 
 
+class SubjectStatsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "leaderboard.json"
+        self.store = LeaderboardStore(self.path)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_no_records_returns_none(self):
+        self.assertIsNone(self.store.stats("g1", "10001"))
+        self.store.add("g1", JudgeRecord(80, "10002", 1))
+        self.assertIsNone(self.store.stats("g1", "10001"))
+
+    def test_aggregates_only_that_subject(self):
+        self.store.add("g1", JudgeRecord(60, "10001", 1))
+        self.store.add("g1", JudgeRecord(90, "10001", 2))
+        self.store.add("g1", JudgeRecord(10, "10002", 3))
+        stats = self.store.stats("g1", "10001")
+        self.assertEqual(stats.count, 2)
+        self.assertEqual(stats.average, 75.0)
+        self.assertEqual(stats.best, 90)
+        self.assertEqual(stats.worst, 60)
+
+    def test_respects_time_window(self):
+        self.store.add("g1", JudgeRecord(20, "10001", 100))
+        self.store.add("g1", JudgeRecord(80, "10001", 200))
+        stats = self.store.stats("g1", "10001", since=150)
+        self.assertEqual(stats.count, 1)
+        self.assertEqual(stats.average, 80.0)
+
+    def test_groups_are_isolated(self):
+        self.store.add("g1", JudgeRecord(90, "10001", 1))
+        self.assertIsNone(self.store.stats("g2", "10001"))
+
+    def test_persistence_roundtrip(self):
+        self.store.add("g1", JudgeRecord(70, "10001", 1))
+        reloaded = LeaderboardStore(self.path)
+        stats = reloaded.stats("g1", "10001")
+        self.assertEqual(stats.count, 1)
+        self.assertEqual(stats.average, 70.0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -51,6 +51,61 @@ class MainHandlerContractTests(unittest.TestCase):
         # 榜与状态一样，所有人可查，应在管理员校验之前返回。
         self.assertLess(board_line, admin_gate_line)
 
+    def test_admin_commands_accept_spaces(self):
+        # 中文输入法常在词间加空格，正则必须容忍（“鉴图 开启”）。
+        source = (ROOT / "image_judge" / "admin.py").read_text(encoding="utf-8")
+        self.assertIn(r"鉴图\s*(开启|关闭|状态)", source)
+        self.assertIn(r"鉴图\s*概率", source)
+        self.assertIn(r"鉴图\s*榜", source)
+
+    def test_subject_stats_commands_are_wired(self):
+        source = main_source()
+        # “鉴图榜 @某人”与“我的鉴图”都走个人战绩渲染。
+        self.assertIn("self._render_subject_stats(", source)
+        self.assertIn("self._at_user_id(event)", source)
+        self.assertIn('command.action == "我的"', source)
+        self.assertIn("self._leaderboard.stats(", source)
+        # 个人战绩同样所有人可查，在管理员校验之前返回。
+        mine_line = source.index('command.action == "我的"')
+        admin_gate_line = source.index("if not self._is_group_admin(event):")
+        self.assertLess(mine_line, admin_gate_line)
+
+    def test_result_cache_is_used_before_calling_llm(self):
+        source = main_source()
+        self.assertIn("ResultCache(", source)
+        self.assertIn("result_cache.cache_key(", source)
+        cache_line = source.index("self._result_cache.get(key)")
+        llm_line = source.index("text = await self._call_llm(event, normalized, style)")
+        put_line = source.index("self._result_cache.put(key, text)")
+        # 先查缓存、未命中才调模型，调用成功后写回缓存。
+        self.assertLess(cache_line, llm_line)
+        self.assertLess(llm_line, put_line)
+
+    def test_auto_trigger_respects_quiet_hours_and_hourly_cap(self):
+        source = main_source()
+        self.assertIn("quiet_hours.is_quiet_now(", source)
+        self.assertIn("HourlyCap(", source)
+        self.assertIn("self._group_hourly.is_ok(", source)
+        self.assertIn("self._group_hourly.mark(", source)
+        # 两个闸门都要在概率判定之前拦住，避免白掷概率。
+        gate_line = source.index("quiet_hours.is_quiet_now(")
+        probability_line = source.index("random.randint(1, 100)")
+        self.assertLess(gate_line, probability_line)
+
+    def test_hourly_cap_is_marked_only_after_images_confirmed(self):
+        source = main_source()
+        # mark 应在“没有图片就返回”之后，纯文本不占配额。
+        empty_guard = source.index("请回复一张图片（或直接发图）")
+        mark_line = source.index("self._group_hourly.mark(")
+        self.assertLess(empty_guard, mark_line)
+
+    def test_download_passes_size_cap(self):
+        source = (ROOT / "image_judge" / "image_utils.py").read_text(encoding="utf-8")
+        # 下载必须带体积上限并在读取中限流，不能读完再判断。
+        self.assertIn("_download(value, session, timeout_seconds, max_bytes)", source)
+        self.assertIn("iter_chunked(", source)
+        self.assertNotIn("return await response.read()", source)
+
     def test_event_is_stopped_only_after_all_yielded_results(self):
         tree = ast.parse(main_source())
         handler = next(

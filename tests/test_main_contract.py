@@ -20,11 +20,15 @@ class MainHandlerContractTests(unittest.TestCase):
         self.assertLess(keyword_line, intent_line)
         self.assertIn("self._avatar_refs(self._message_parts(event))", source)
 
-    def test_raw_message_urls_only_mined_when_reply_exists(self):
-        # 无回复时 raw_message 只含当前消息文本，扫它会误下载用户手打的 URL。
+    def test_raw_message_urls_only_mined_from_reply_segments(self):
+        # 直接扫整条 raw_message 会把当前消息正文里手打的 URL 也下载下来，
+        # 所以只允许在 reply / quote 段内挖被回复消息的内容。
         source = main_source()
+        self.assertIn("extract_reply_embedded_image_urls(", source)
+        utils = (ROOT / "image_judge" / "image_utils.py").read_text(encoding="utf-8")
+        self.assertIn('_REPLY_SEGMENT_TYPES = ("reply", "quote", "reference")', utils)
         no_reply_line = source.index("if reply is None:")
-        extract_line = source.index("extract_image_urls(getattr(event.message_obj, \"raw_message\"")
+        extract_line = source.index("extract_reply_embedded_image_urls(")
         self.assertLess(no_reply_line, extract_line)
 
     def test_invalid_probability_gets_usage_hint(self):
@@ -160,6 +164,39 @@ class MainHandlerContractTests(unittest.TestCase):
         self.assertIn("_may_carry_image(event)", source)
         self.assertIn("isinstance(comp, Comp.Reply)", source)
 
+    def test_auto_trigger_ignores_images_from_replies(self):
+        # 回复里的旧图不应被自动触发反复点评，只有当前消息自带的图才算。
+        source = main_source()
+        self.assertIn("self._may_carry_image(event, allow_reply=False)", source)
+        self.assertIn(
+            "if auto_mode:\n            images = self._collect_current_images(event)",
+            source,
+        )
+
+    def test_group_quiet_hours_and_hourly_limit_commands_are_wired(self):
+        source = main_source()
+        self.assertIn('command.action == "免打扰"', source)
+        self.assertIn('command.action == "上限"', source)
+        self.assertIn("quiet_hours=None", source)
+        self.assertIn("hourly_limit=command.value", source)
+        self.assertIn("limit=settings.hourly_limit", source)
+        self.assertIn("self._group_hourly.mark(group_key, limit=limit)", source)
+
+    def test_help_command_is_available_to_everyone(self):
+        source = main_source()
+        help_line = source.index('command.action == "帮助"')
+        admin_gate_line = source.index("if not self._is_group_admin(event):")
+        self.assertLess(help_line, admin_gate_line)
+        self.assertIn("_HELP_TEXT", source)
+
+    def test_multiple_images_are_part_of_cache_key(self):
+        source = main_source()
+        self.assertIn("[image.data_url for image in normalized], style", source)
+
+    def test_leaderboard_ranks_each_subject_once(self):
+        source = main_source()
+        self.assertIn("self._leaderboard.top_subjects(", source)
+
     def test_auto_cooldown_marked_only_after_images_collected(self):
         source = main_source()
         self.assertIn("_auto_cooldown.mark", source)
@@ -177,7 +214,7 @@ class MainHandlerContractTests(unittest.TestCase):
 
     def test_avatar_fallback_judges_at_targets(self):
         source = main_source()
-        self.assertIn("_avatar_refs(message_parts)", source)
+        self.assertIn("self._avatar_refs(self._message_parts(event))", source)
         self.assertIn("isinstance(comp, Comp.At)", source)
         self.assertIn("qq_avatar_url(qq)", source)
         self.assertIn('"enable_avatar_judge"', source)
@@ -217,7 +254,7 @@ class MainHandlerContractTests(unittest.TestCase):
         source = main_source()
         self.assertIn("isinstance(comp, Comp.Image)", source)
         self.assertIn("is_plausible_image_ref(value)", source)
-        self.assertIn("extract_image_urls(", source)
+        self.assertIn("extract_reply_embedded_image_urls(", source)
 
     def test_replied_images_are_collected_in_three_tiers(self):
         source = main_source()
@@ -225,7 +262,7 @@ class MainHandlerContractTests(unittest.TestCase):
         self.assertIn("_collect_replied_image_refs", source)
         self.assertIn("isinstance(comp, Comp.Reply)", source)
         self.assertIn("_image_refs_from_chain(reply.chain", source)
-        self.assertIn("extract_image_urls(getattr(event.message_obj, \"raw_message\"", source)
+        self.assertIn("extract_reply_embedded_image_urls(", source)
         # get_msg 兜底：仅 OneBot，且必须有可调用守卫。
         self.assertIn("call_action(\"get_msg\", message_id=int(message_id)", source)
         self.assertIn("if not callable(call_action):", source)

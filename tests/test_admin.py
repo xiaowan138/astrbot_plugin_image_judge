@@ -1,6 +1,8 @@
 import unittest
 
 from image_judge.admin import (
+    DISABLE_WORD,
+    FOLLOW_WORD,
     AdminCommand,
     is_valid_board_scope,
     parse_admin_command,
@@ -122,6 +124,71 @@ class ParseAdminCommandTests(unittest.TestCase):
         # 普通触发不应被管理指令拦截。
         self.assertIsNone(parse_admin_command("打分 毒舌"))
         self.assertIsNone(parse_admin_command("锐评"))
+
+    def test_normal_chat_starting_with_command_prefix_is_not_a_command(self):
+        # 只是恰好以指令前缀开头的正常聊天，不能当指令（否则会回用法提示
+        # 并 stop_event 拦掉主 agent）。
+        for text in (
+            "鉴图榜上无名啊",
+            "鉴图榜单一出来吓一跳",
+            "我的鉴定结果呢",
+            "我的战绩不理想",
+        ):
+            self.assertIsNone(parse_admin_command(text), text)
+
+    def test_scope_without_space_still_parses(self):
+        self.assertEqual(parse_admin_command("我的鉴图本周"), command("我的", scope="week"))
+        self.assertEqual(parse_admin_command("鉴图榜总"), command("榜", scope="all"))
+
+    def test_help_command(self):
+        for text in ("鉴图帮助", "鉴图 帮助", "鉴图用法", "鉴图指令", "鉴图菜单"):
+            self.assertEqual(parse_admin_command(text), command("帮助"), text)
+
+    def test_quiet_hours_command(self):
+        self.assertEqual(
+            parse_admin_command("鉴图免打扰 23:00-08:00"),
+            AdminCommand("免打扰", text="23:00-08:00"),
+        )
+        self.assertEqual(
+            parse_admin_command("鉴图 免打扰 12:00-13:30"),
+            AdminCommand("免打扰", text="12:00-13:30"),
+        )
+        self.assertEqual(
+            parse_admin_command("鉴图免打扰 关闭"),
+            AdminCommand("免打扰", text=DISABLE_WORD),
+        )
+        self.assertEqual(
+            parse_admin_command("鉴图免打扰 跟随"),
+            AdminCommand("免打扰", text=FOLLOW_WORD),
+        )
+
+    def test_quiet_hours_without_value_requests_usage(self):
+        self.assertEqual(parse_admin_command("鉴图免打扰"), AdminCommand("免打扰"))
+
+    def test_invalid_quiet_hours_is_flagged(self):
+        for text in ("鉴图免打扰 25:00-08:00", "鉴图免打扰 晚上", "鉴图免打扰 8点"):
+            parsed = parse_admin_command(text)
+            self.assertEqual(parsed.action, "免打扰", text)
+            self.assertTrue(parsed.invalid, text)
+
+    def test_hourly_limit_command(self):
+        self.assertEqual(parse_admin_command("鉴图上限 10"), AdminCommand("上限", 10))
+        self.assertEqual(parse_admin_command("鉴图 上限 0"), AdminCommand("上限", 0))
+        self.assertEqual(
+            parse_admin_command("鉴图每小时上限 5"), AdminCommand("上限", 5)
+        )
+        self.assertEqual(
+            parse_admin_command("鉴图上限 跟随"),
+            AdminCommand("上限", text=FOLLOW_WORD),
+        )
+
+    def test_hourly_limit_without_value_requests_usage(self):
+        self.assertEqual(parse_admin_command("鉴图上限"), AdminCommand("上限"))
+
+    def test_non_numeric_hourly_limit_is_flagged(self):
+        parsed = parse_admin_command("鉴图上限 很多")
+        self.assertEqual(parsed.action, "上限")
+        self.assertTrue(parsed.invalid)
 
 
 if __name__ == "__main__":

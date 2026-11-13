@@ -9,6 +9,7 @@ from image_judge.image_utils import (
     _compress_for_provider,
     _mime_from_magic,
     extract_image_urls,
+    extract_reply_embedded_image_urls,
     is_plausible_image_ref,
     normalize_image_ref,
     qq_avatar_url,
@@ -380,6 +381,64 @@ class ExtractImageUrlsTests(unittest.TestCase):
     def test_dedupes(self):
         raw = {"a": "https://a.cn/x.png", "b": "https://a.cn/x.png"}
         self.assertEqual(len(extract_image_urls(raw)), 1)
+
+
+class ExtractReplyEmbeddedUrlsTests(unittest.TestCase):
+    """只允许从回复段里挖 URL，避免下载当前消息正文里手打的地址。"""
+
+    def test_extracts_images_nested_in_reply_segment(self):
+        raw = {
+            "message": [
+                {
+                    "type": "reply",
+                    "data": {
+                        "id": "123",
+                        "message": [
+                            {
+                                "type": "image",
+                                "data": {"url": "https://gchat.qpic.cn/abc/123"},
+                            }
+                        ],
+                    },
+                },
+                {"type": "text", "data": {"text": "打分"}},
+            ]
+        }
+        self.assertEqual(
+            extract_reply_embedded_image_urls(raw),
+            ["https://gchat.qpic.cn/abc/123"],
+        )
+
+    def test_ignores_url_typed_in_current_message(self):
+        raw = {
+            "message": [
+                {"type": "reply", "data": {"id": "123"}},
+                {
+                    "type": "text",
+                    "data": {"text": "打分 http://127.0.0.1/secret.png"},
+                },
+            ]
+        }
+        self.assertEqual(extract_reply_embedded_image_urls(raw), [])
+
+    def test_tolerates_missing_or_unknown_payload(self):
+        for payload in (None, "raw text", {}, {"message": "not-a-list"}, [42]):
+            self.assertEqual(extract_reply_embedded_image_urls(payload), [])
+
+    def test_supports_quote_and_reference_segments(self):
+        for segment_type in ("quote", "reference"):
+            raw = {
+                "message": [
+                    {
+                        "type": segment_type,
+                        "data": {"url": "https://cdn.example.com/photo.jpg"},
+                    }
+                ]
+            }
+            self.assertEqual(
+                extract_reply_embedded_image_urls(raw),
+                ["https://cdn.example.com/photo.jpg"],
+            )
 
 
 if __name__ == "__main__":

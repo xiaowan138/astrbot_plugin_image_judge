@@ -74,6 +74,23 @@ class HourlyCapTests(unittest.TestCase):
         cap = HourlyCap(-5)
         self.assertFalse(cap.enabled)
 
+    def test_per_call_limit_overrides_default(self):
+        # 群级覆盖：同一个 cap 对象按调用方传入的本群上限判定。
+        clock = {"now": 0.0}
+        cap = HourlyCap(0, window_seconds=3600, clock=lambda: clock["now"])
+        for _ in range(2):
+            self.assertTrue(asyncio.run(cap.is_ok("g", limit=2)))
+            asyncio.run(cap.mark("g", limit=2))
+        self.assertFalse(asyncio.run(cap.is_ok("g", limit=2)))
+        # 本群改成不限后立刻恢复可用。
+        self.assertTrue(asyncio.run(cap.is_ok("g", limit=0)))
+
+    def test_per_call_limit_is_independent_per_key(self):
+        cap = HourlyCap(0, window_seconds=3600)
+        asyncio.run(cap.mark("g1", limit=1))
+        self.assertFalse(asyncio.run(cap.is_ok("g1", limit=1)))
+        self.assertTrue(asyncio.run(cap.is_ok("g2", limit=1)))
+
 
 class DailyQuotaTests(unittest.TestCase):
     def test_allows_until_limit(self):

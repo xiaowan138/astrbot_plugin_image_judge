@@ -121,6 +121,45 @@ class LeaderboardStoreTests(unittest.TestCase):
         self.assertEqual([r.score for r in top], [4, 3, 2])
 
 
+class TopSubjectsTests(unittest.TestCase):
+    """榜单按人聚合：同一个人反复发图不能占满整个榜单。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "leaderboard.json"
+        self.store = LeaderboardStore(self.path)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_keeps_only_best_record_per_subject(self):
+        for score in (60, 95, 80):
+            self.store.add("g1", JudgeRecord(score, "same", float(score)))
+        self.store.add("g1", JudgeRecord(70, "other", 99))
+        top = self.store.top_subjects("g1")
+        self.assertEqual(
+            [(record.subject_id, record.score) for record in top],
+            [("same", 95), ("other", 70)],
+        )
+
+    def test_tie_keeps_earliest_record(self):
+        self.store.add("g1", JudgeRecord(90, "a", 2))
+        self.store.add("g1", JudgeRecord(90, "a", 1))
+        top = self.store.top_subjects("g1")
+        self.assertEqual(len(top), 1)
+        self.assertEqual(top[0].ts, 1)
+
+    def test_respects_time_window_and_limit(self):
+        self.store.add("g1", JudgeRecord(99, "old", 100))
+        self.store.add("g1", JudgeRecord(50, "a", 200))
+        self.store.add("g1", JudgeRecord(40, "b", 300))
+        top = self.store.top_subjects("g1", since=150, limit=1)
+        self.assertEqual([record.subject_id for record in top], ["a"])
+
+    def test_empty_group(self):
+        self.assertEqual(self.store.top_subjects("missing"), [])
+
+
 class SubjectStatsTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

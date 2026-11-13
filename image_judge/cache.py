@@ -10,14 +10,22 @@ from __future__ import annotations
 import hashlib
 import time
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 
-def cache_key(data_url: str, style: str) -> str:
+def cache_key(data_urls: str | Iterable[str], style: str) -> str:
+    """缓存 key = 风格 + 全部图片内容。
+
+    多图模式（``max_images_per_message`` > 1）必须把每张图都算进去，
+    否则首图相同、次图不同时会错误命中旧结果。
+    """
+    if isinstance(data_urls, str):
+        data_urls = (data_urls,)
     digest = hashlib.sha256()
     digest.update(style.encode("utf-8"))
-    digest.update(b"\x1f")
-    digest.update((data_url or "").encode("utf-8"))
+    for data_url in data_urls:
+        digest.update(b"\x1e")
+        digest.update((data_url or "").encode("utf-8"))
     return digest.hexdigest()
 
 

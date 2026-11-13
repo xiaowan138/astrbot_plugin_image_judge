@@ -28,22 +28,40 @@ from .image_judge import quiet_hours
 from .image_judge import renderer as card_renderer
 from .image_judge import trigger
 from .image_judge.admin import (
+    DISABLE_WORD,
+    FOLLOW_WORD,
     AdminCommand,
     is_valid_board_scope,
     parse_admin_command,
 )
 from .image_judge.cache import ResultCache
 from .image_judge.cooldown import DailyQuota, HourlyCap, UserCooldown
-from .image_judge.group_config import GroupConfigStore, effective_settings
+from .image_judge.group_config import (
+    EffectiveSettings,
+    GroupConfigStore,
+    effective_settings,
+)
 from .image_judge.image_utils import (
     DEFAULT_USER_AGENT,
-    extract_image_urls,
+    extract_reply_embedded_image_urls,
     is_plausible_image_ref,
     normalize_image_ref,
     qq_avatar_url,
 )
 from .image_judge.judge import parse_judgement
 from .image_judge.leaderboard import JudgeRecord, LeaderboardStore
+
+_HELP_TEXT = (
+    "AI 鉴图指令\n"
+    "· 打分 / 鉴图 / 点评 / 评价 / 锐评 [风格] —— 回复图片或直接发图触发\n"
+    "· 锐评 @某人 —— 给 TA 的头像打分（主要支持 QQ）\n"
+    "· 鉴图榜 [今日/本周/总] —— 本群高分榜（每人取最高分）\n"
+    "· 鉴图榜 @某人 / 我的鉴图 [今日/本周/总] —— 个人战绩\n"
+    "· 鉴图状态 —— 查看本群当前设置\n"
+    "· 鉴图开启 / 鉴图关闭 / 鉴图概率 0-100 —— 群管理：自动鉴图开关与概率\n"
+    "· 鉴图免打扰 23:00-08:00 / 关闭 / 跟随 —— 群管理：免打扰时段\n"
+    "· 鉴图上限 10 / 0（不限） / 跟随 —— 群管理：每小时自动触发上限"
+)
 
 
 class ImageJudgePlugin(Star):
@@ -154,33 +172,45 @@ class ImageJudgePlugin(Star):
         group_id = self._group_id(event)
         if not group_id:
             return False, False
-        # 免打扰时段只拦自动触发；关键词触发是用户主动发起，任何时段都响应。
-        if quiet_hours.is_quiet_now(str(self.config.get("quiet_hours", "") or "")):
-            return False, False
         allowlist = str(self.config.get("group_allowlist", "") or "").strip()
         if allowlist:
             allowed = {g.strip() for g in allowlist.split(",") if g.strip()}
             if group_id not in allowed:
                 return False, False
-        settings = effective_settings(
-            global_enabled=True,
+        settings = self._effective_settings(group_id)
+        if not settings.enabled:
+            return False, False
+        # 免打扰时段只拦自动触发；关键词触发是用户主动发起，任何时段都响应。
+        if quiet_hours.is_quiet_now(settings.quiet_hours):
+            return False, False
+        # 自动触发只对“当前消息自带图”掷概率：回复里的旧图不重复点评，
+        # 纯文本也不浪费概率与群冷却。
+        if not self._may_carry_image(event, allow_reply=False):
+            return False, False
+        if settings.probability <= 0 or random.randint(1, 100) > settings.probability:
+            return False, False
+        group_key = f"group\x1f{group_id}"
+        if not await self._auto_cooldown.is_ok(group_key):
+            return False, False
+        if not await self._group_hourly.is_ok(
+            group_key, limit=settings.hourly_limit
+        ):
+            return False, False
+        return True, True
+
+    def _effective_settings(self, group_id: str) -> EffectiveSettings:
+        """本群最终生效的自动触发设置（全局默认 + 本群覆盖）。"""
+        return effective_settings(
+            global_enabled=bool(self.config.get("enable_auto_trigger", False)),
             global_probability=self._config_int(
                 "auto_trigger_probability", 20, 0, 100
             ),
             override=self._group_config.get(group_id),
+            global_quiet_hours=str(self.config.get("quiet_hours", "") or ""),
+            global_hourly_limit=self._config_int(
+                "group_hourly_limit", 0, 0, 10000
+            ),
         )
-        if not settings.enabled:
-            return False, False
-        # 自动触发只对可能带图的消息掷概率，纯文本不浪费概率与群冷却。
-        if not self._may_carry_image(event):
-            return False, False
-        if settings.probability <= 0 or random.randint(1, 100) > settings.probability:
-            return False, False
-        if not await self._auto_cooldown.is_ok(f"group\x1f{group_id}"):
-            return False, False
-        if not await self._group_hourly.is_ok(f"group\x1f{group_id}"):
-            return False, False
-        return True, True
 
     @staticmethod
     def _message_parts(event: AstrMessageEvent) -> list:
@@ -189,8 +219,13 @@ class ImageJudgePlugin(Star):
         except (AttributeError, TypeError):
             return []
 
-    def _may_carry_image(self, event: AstrMessageEvent) -> bool:
-        """轻量判断消息是否可能带图：含图片组件（跳过表情包）或回复组件。"""
+    def _may_carry_image(
+        self, event: AstrMessageEvent, *, allow_reply: bool = True
+    ) -> bool:
+        """轻量判断消息是否可能带图：含图片组件（跳过表情包）或回复组件。
+
+        自动触发时 ``allow_reply=False``：回复里的旧图不应被反复点评。
+        """
         message_parts = self._message_parts(event)
         ignore_sticker = bool(self.config.get("ignore_sticker", True))
         has_reply = False
@@ -199,12 +234,16 @@ class ImageJudgePlugin(Star):
                 if ignore_sticker and self._is_sticker(comp):
                     continue
                 return True
-            if isinstance(comp, Comp.Reply):
+            if allow_reply and isinstance(comp, Comp.Reply):
                 has_reply = True
         return has_reply
 
     async def _handle_judge(self, event: AstrMessageEvent, auto_mode: bool):
-        images = await self._collect_images(event)
+        # 自动触发只点评当前消息自带的图，被回复的旧图交给关键词触发。
+        if auto_mode:
+            images = self._collect_current_images(event)
+        else:
+            images = await self._collect_images(event)
         max_images = self._config_int("max_images_per_message", 1, 1, 10)
         images = images[:max_images]
         if not images:
@@ -216,8 +255,10 @@ class ImageJudgePlugin(Star):
             # 确认有图才消耗群冷却与每小时配额，纯文本不烧掉自动触发机会。
             group_id = self._group_id(event)
             if group_id:
-                await self._auto_cooldown.mark(f"group\x1f{group_id}")
-                await self._group_hourly.mark(f"group\x1f{group_id}")
+                group_key = f"group\x1f{group_id}"
+                limit = self._effective_settings(group_id).hourly_limit
+                await self._auto_cooldown.mark(group_key)
+                await self._group_hourly.mark(group_key, limit=limit)
 
         user_key = self._user_key(event)
         if not auto_mode:
@@ -253,7 +294,10 @@ class ImageJudgePlugin(Star):
 
         style = self._detect_style(event.message_str or "")
         # 同一张图（内容相同）在有效期内直接复用上次的模型输出，省额度。
-        key = result_cache.cache_key(normalized[0].data_url, style)
+        # 多图模式必须把每张图都算进 key，否则次图不同会错误命中。
+        key = result_cache.cache_key(
+            [image.data_url for image in normalized], style
+        )
         text = self._result_cache.get(key)
         if text is None:
             try:
@@ -320,6 +364,9 @@ class ImageJudgePlugin(Star):
         if not group_id:
             yield event.plain_result("该指令仅在群聊中可用。")
             return
+        if command.action == "帮助":
+            yield event.plain_result(_HELP_TEXT)
+            return
         if command.action == "状态":
             yield event.plain_result(self._describe_group_status(group_id))
             return
@@ -365,6 +412,48 @@ class ImageJudgePlugin(Star):
                 self._group_config.set(group_id, enabled=False)
                 yield event.plain_result("本群自动鉴图已关闭，关键词触发不受影响。")
                 return
+            if command.action == "免打扰":
+                if command.invalid or not command.text:
+                    yield event.plain_result(
+                        "用法：鉴图免打扰 23:00-08:00（跨零点自动识别），"
+                        "也可“鉴图免打扰 关闭”或“鉴图免打扰 跟随”。"
+                    )
+                    return
+                if command.text == FOLLOW_WORD:
+                    self._group_config.set(group_id, quiet_hours=None)
+                    yield event.plain_result("本群免打扰时段已恢复跟随全局设置。")
+                    return
+                if command.text == DISABLE_WORD:
+                    self._group_config.set(group_id, quiet_hours="")
+                    yield event.plain_result("本群免打扰时段已关闭。")
+                    return
+                self._group_config.set(group_id, quiet_hours=command.text)
+                yield event.plain_result(
+                    f"本群免打扰时段已设为 {command.text}，该时段内不自动触发。"
+                )
+                return
+            if command.action == "上限":
+                if command.text == FOLLOW_WORD:
+                    self._group_config.set(group_id, hourly_limit=None)
+                    yield event.plain_result("本群每小时自动触发上限已恢复跟随全局设置。")
+                    return
+                if command.invalid or command.value is None:
+                    yield event.plain_result(
+                        "用法：鉴图上限 10（每小时自动触发次数，0 表示不限），"
+                        "也可“鉴图上限 跟随”。"
+                    )
+                    return
+                if not 0 <= command.value <= 10000:
+                    yield event.plain_result("上限需要在 0-10000 之间。")
+                    return
+                self._group_config.set(group_id, hourly_limit=command.value)
+                if command.value == 0:
+                    yield event.plain_result("本群每小时自动触发上限已设为不限。")
+                else:
+                    yield event.plain_result(
+                        f"本群每小时自动触发上限已设为 {command.value} 次。"
+                    )
+                return
             if command.invalid:
                 yield event.plain_result("用法：鉴图概率 0-100（纯数字），如“鉴图概率 50”。")
                 return
@@ -381,22 +470,24 @@ class ImageJudgePlugin(Star):
             yield event.plain_result("保存设置失败，请查看 AstrBot 日志。")
 
     def _describe_group_status(self, group_id: str) -> str:
-        settings = effective_settings(
-            global_enabled=bool(self.config.get("enable_auto_trigger", False)),
-            global_probability=self._config_int(
-                "auto_trigger_probability", 20, 0, 100
-            ),
-            override=self._group_config.get(group_id),
-        )
+        settings = self._effective_settings(group_id)
         lines = [
             f"自动鉴图（本群）：{'开启' if settings.enabled else '关闭'}",
             f"触发概率：{settings.probability}%（{settings.probability_source}）",
             f"触发冷却：{self._config_int('auto_trigger_cooldown_seconds', 300, 0, 86400)} 秒",
         ]
-        hourly = self._config_int("group_hourly_limit", 0, 0, 10000)
-        lines.append(f"每小时上限：{hourly} 次" if hourly > 0 else "每小时上限：不限")
-        quiet = str(self.config.get("quiet_hours", "") or "").strip()
-        lines.append(f"免打扰时段：{quiet}" if quiet else "免打扰时段：未设置")
+        hourly = settings.hourly_limit
+        lines.append(
+            f"每小时上限：{hourly} 次（{settings.hourly_limit_source}）"
+            if hourly > 0
+            else f"每小时上限：不限（{settings.hourly_limit_source}）"
+        )
+        if settings.quiet_hours:
+            lines.append(
+                f"免打扰时段：{settings.quiet_hours}（{settings.quiet_hours_source}）"
+            )
+        else:
+            lines.append(f"免打扰时段：未设置（{settings.quiet_hours_source}）")
         lines.append("发送“打分 / 鉴图”等关键词可随时手动触发。")
         return "\n".join(lines)
 
@@ -413,7 +504,7 @@ class ImageJudgePlugin(Star):
     def _render_leaderboard(self, group_id: str, scope: str) -> str:
         """渲染“鉴图榜”文本：scope = today / week / all。"""
         since, title = self._board_window(scope)
-        records = self._leaderboard.top(group_id, since=since, limit=5)
+        records = self._leaderboard.top_subjects(group_id, since=since, limit=5)
         if not records:
             return f"本群{title}还没有鉴图记录，发张图配“打分”试试。"
         lines = [f"本群鉴图榜（{title}）"]
@@ -497,8 +588,8 @@ class ImageJudgePlugin(Star):
         except Exception:
             return False
 
-    async def _collect_images(self, event: AstrMessageEvent) -> list[str]:
-        """收集待鉴图图片：当前消息的图 → 被回复消息的图 → @目标的头像。"""
+    def _collect_current_images(self, event: AstrMessageEvent) -> list[str]:
+        """当前消息自带的图片引用（不含回复与 @头像）。"""
         refs: list[str] = []
         message_parts = self._message_parts(event)
         ignore_sticker = bool(self.config.get("ignore_sticker", True))
@@ -510,12 +601,18 @@ class ImageJudgePlugin(Star):
             ref = self._image_ref(comp)
             if ref:
                 refs.append(ref)
+        return refs
+
+    async def _collect_images(self, event: AstrMessageEvent) -> list[str]:
+        """收集待鉴图图片：当前消息的图 → 被回复消息的图 → @目标的头像。"""
+        refs = self._collect_current_images(event)
         if refs:
             return refs
+        ignore_sticker = bool(self.config.get("ignore_sticker", True))
         refs = await self._collect_replied_image_refs(event, ignore_sticker)
         if refs:
             return refs
-        return self._avatar_refs(message_parts)
+        return self._avatar_refs(self._message_parts(event))
 
     def _avatar_refs(self, message_parts) -> list[str]:
         """“锐评 @某人”：把被 @ 的 QQ 号转成头像直链（主要支持 QQ 平台）。"""
@@ -554,9 +651,11 @@ class ImageJudgePlugin(Star):
         if refs:
             return refs
 
-        # 仅在存在回复时才扫原始消息 JSON：无回复时 raw_message 只含当前
-        # 消息文本，扫它会把用户手打的任意 URL 也下载下来。
-        refs = extract_image_urls(getattr(event.message_obj, "raw_message", None))
+        # 只在“回复段”内挖原始 JSON：直接扫整条 raw_message 会把当前消息正文里
+        # 用户手打的 URL（可能是内网地址）也当成图片下载。
+        refs = extract_reply_embedded_image_urls(
+            getattr(event.message_obj, "raw_message", None)
+        )
         if refs:
             return refs
 

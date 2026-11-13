@@ -27,6 +27,19 @@ class CacheKeyTests(unittest.TestCase):
         self.assertEqual(len(key), 64)
         self.assertTrue(all(char in "0123456789abcdef" for char in key))
 
+    def test_all_images_participate_in_key(self):
+        # 多图模式：首图相同、次图不同必须命中不同的 key。
+        self.assertNotEqual(
+            cache_key(["data:image/jpeg;base64,AAA", "data:image/jpeg;base64,BBB"], "毒舌"),
+            cache_key(["data:image/jpeg;base64,AAA", "data:image/jpeg;base64,CCC"], "毒舌"),
+        )
+
+    def test_single_string_is_backwards_compatible(self):
+        self.assertEqual(
+            cache_key("data:image/jpeg;base64,AAA", "毒舌"),
+            cache_key(["data:image/jpeg;base64,AAA"], "毒舌"),
+        )
+
 
 class ResultCacheTests(unittest.TestCase):
     def setUp(self):

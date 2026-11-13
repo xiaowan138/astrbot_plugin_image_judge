@@ -46,6 +46,43 @@ class EffectiveSettingsTests(unittest.TestCase):
         )
         self.assertFalse(result.enabled)
 
+    def test_quiet_hours_and_hourly_limit_follow_global_by_default(self):
+        result = effective_settings(
+            global_enabled=True,
+            global_probability=20,
+            override=GroupOverride(),
+            global_quiet_hours="23:00-08:00",
+            global_hourly_limit=10,
+        )
+        self.assertEqual(result.quiet_hours, "23:00-08:00")
+        self.assertEqual(result.quiet_hours_source, "全局默认")
+        self.assertEqual(result.hourly_limit, 10)
+        self.assertEqual(result.hourly_limit_source, "全局默认")
+
+    def test_group_overrides_quiet_hours_and_hourly_limit(self):
+        result = effective_settings(
+            global_enabled=True,
+            global_probability=20,
+            override=GroupOverride(quiet_hours="12:00-13:00", hourly_limit=3),
+            global_quiet_hours="23:00-08:00",
+            global_hourly_limit=10,
+        )
+        self.assertEqual(result.quiet_hours, "12:00-13:00")
+        self.assertEqual(result.quiet_hours_source, "本群")
+        self.assertEqual(result.hourly_limit, 3)
+        self.assertEqual(result.hourly_limit_source, "本群")
+
+    def test_empty_quiet_hours_disables_global_window_for_this_group(self):
+        # 空字符串 = 本群显式关闭免打扰，与 None（跟随全局）区分开。
+        result = effective_settings(
+            global_enabled=True,
+            global_probability=20,
+            override=GroupOverride(quiet_hours=""),
+            global_quiet_hours="23:00-08:00",
+        )
+        self.assertEqual(result.quiet_hours, "")
+        self.assertEqual(result.quiet_hours_source, "本群")
+
 
 class GroupConfigStoreTests(unittest.TestCase):
     def test_set_and_get_roundtrip(self):
@@ -75,6 +112,36 @@ class GroupConfigStoreTests(unittest.TestCase):
             path.write_text("{ not json", encoding="utf-8")
             store = GroupConfigStore(path)
             self.assertEqual(store.get("123"), GroupOverride())
+
+    def test_quiet_hours_and_hourly_limit_roundtrip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "group_config.json"
+            store = GroupConfigStore(path)
+            store.set("123", quiet_hours="12:00-13:00", hourly_limit=5)
+            self.assertEqual(
+                store.get("123"),
+                GroupOverride(quiet_hours="12:00-13:00", hourly_limit=5),
+            )
+            reopened = GroupConfigStore(path)
+            self.assertEqual(
+                reopened.get("123"),
+                GroupOverride(quiet_hours="12:00-13:00", hourly_limit=5),
+            )
+
+    def test_quiet_hours_can_be_disabled_per_group(self):
+        # 空字符串要原样保存，不能被当作“未设置”丢掉。
+        with tempfile.TemporaryDirectory() as directory:
+            store = GroupConfigStore(Path(directory) / "group_config.json")
+            store.set("123", quiet_hours="")
+            self.assertEqual(store.get("123").quiet_hours, "")
+            store.set("123", quiet_hours=None)
+            self.assertIsNone(store.get("123").quiet_hours)
+
+    def test_hourly_limit_zero_means_unlimited_and_roundtrips(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = GroupConfigStore(Path(directory) / "group_config.json")
+            store.set("123", hourly_limit=0)
+            self.assertEqual(store.get("123").hourly_limit, 0)
 
 
 if __name__ == "__main__":

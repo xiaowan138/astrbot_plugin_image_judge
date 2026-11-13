@@ -134,6 +134,25 @@ class LeaderboardStore:
         records.sort(key=lambda record: (-record.score, record.ts))
         return records[: max(int(limit), 1)]
 
+    def top_subjects(
+        self, group_id: str, *, since: float | None = None, limit: int = 5
+    ) -> list[JudgeRecord]:
+        """按受评者聚合的最高分榜单：每人只保留自己最好的一条记录。
+
+        不聚合时同一个人反复发图就能占满整个榜单；这里按人去重后再排序。
+        """
+        best: dict[str, JudgeRecord] = {}
+        for record in self._window(group_id, since):
+            current = best.get(record.subject_id)
+            if (
+                current is None
+                or record.score > current.score
+                or (record.score == current.score and record.ts < current.ts)
+            ):
+                best[record.subject_id] = record
+        records = sorted(best.values(), key=lambda record: (-record.score, record.ts))
+        return records[: max(int(limit), 1)]
+
     def worst(self, group_id: str, *, since: float | None = None) -> JudgeRecord | None:
         """时间窗口内分数最低的一条（同分取最近一次）。"""
         records = self._window(group_id, since)

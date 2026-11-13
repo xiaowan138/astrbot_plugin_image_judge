@@ -27,6 +27,9 @@ _IMAGE_URL_RE = re.compile(r"https?://[^\s<>\"'`]+", re.I)
 _IMAGE_EXT_RE = re.compile(r"\.(?:jpe?g|png|gif|webp|bmp)(?:$|[?#])", re.I)
 _TRAILING_PUNCTUATION = "。，、；：！？,.!?:;)]}〉》」』】\"'"
 
+#: 原始消息 JSON 里表示“回复/引用”的段类型（各平台命名不一）。
+_REPLY_SEGMENT_TYPES = ("reply", "quote", "reference")
+
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -191,6 +194,9 @@ async def normalize_image_ref(
         if not path.is_file():
             return None
         try:
+            # 先看大小再读，避免超大本地文件整体进内存。
+            if path.stat().st_size > max_bytes:
+                return None
             raw = path.read_bytes()
         except OSError:
             return None
@@ -254,11 +260,38 @@ def _looks_like_image_url(url: str) -> bool:
 
 
 def extract_image_urls(payload: Any) -> list[str]:
-    """从原始消息 JSON 中递归提取图片 URL（处理回复消息内嵌图片）。"""
+    """从任意嵌套结构（如原始消息 JSON）中递归提取图片 URL。"""
     found: list[str] = []
     for text in _iter_strings(payload):
         for match in _IMAGE_URL_RE.finditer(text):
             url = match.group(0).rstrip(_TRAILING_PUNCTUATION)
             if _looks_like_image_url(url) and url not in found:
+                found.append(url)
+    return found
+
+
+def extract_reply_embedded_image_urls(payload: Any) -> list[str]:
+    """只从“回复段”里挖被回复消息的图片 URL。
+
+    直接扫整条 raw_message 会把当前消息正文里用户手打的 URL 也一起下载
+    （可能是内网地址），因此这里限定只解析 reply / quote / reference 段的
+    ``data``，其余部分（当前消息本体）一律不碰。
+    """
+    segments: list[Any] = []
+    if isinstance(payload, dict):
+        for key in ("message", "raw_message"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                segments.extend(value)
+    elif isinstance(payload, list):
+        segments = payload
+    found: list[str] = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        if str(segment.get("type") or "").lower() not in _REPLY_SEGMENT_TYPES:
+            continue
+        for url in extract_image_urls(segment.get("data")):
+            if url not in found:
                 found.append(url)
     return found

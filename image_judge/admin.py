@@ -1,4 +1,4 @@
-"""群管理子指令解析（鉴图开启/关闭/概率/状态/榜/我的）。
+"""群管理子指令解析（鉴图开启/关闭/概率/状态/榜/我的/免打扰/上限/帮助）。
 
 指令是关键词触发的前缀子集（如“鉴图开启”本身含触发词“鉴图”），
 在 main 里先于普通触发解析，避免同一条消息被当成普通鉴图指令。
@@ -11,13 +11,25 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from .quiet_hours import parse_quiet_hours
+
 _SIMPLE_RE = re.compile(r"鉴图\s*(开启|关闭|状态)")
 _PROBABILITY_RE = re.compile(r"鉴图\s*概率(?:\s*(\S+))?")
 _BOARD_RE = re.compile(r"鉴图\s*榜(.*)", re.S)
 _MINE_RE = re.compile(r"我的\s*(?:鉴图|战绩|鉴定)(.*)", re.S)
+_QUIET_RE = re.compile(r"鉴图\s*免打扰(?:\s*(\S+))?", re.S)
+_HOURLY_RE = re.compile(r"鉴图\s*(?:每小时)?\s*上限(?:\s*(\S+))?", re.S)
+_HELP_RE = re.compile(r"鉴图\s*(?:帮助|用法|指令|命令|菜单|help)", re.I)
 
 #: @提及：部分平台会把被 @ 的人渲染进 message_str，解析范围词前要先剔掉。
 _MENTION_RE = re.compile(r"@\S+")
+
+#: “本群关闭该功能”与“恢复跟随全局”的标准化指令词。
+DISABLE_WORD = "关闭"
+FOLLOW_WORD = "跟随"
+
+_DISABLE_WORDS = ("关闭", "关", "取消", "off")
+_FOLLOW_WORDS = ("跟随", "默认", "全局", "reset")
 
 #: “鉴图榜”的时间范围词 -> 内部标识（today / week / all）。
 _BOARD_SCOPES = {
@@ -36,10 +48,12 @@ _BOARD_SCOPES_VALID = ("today", "week", "all")
 
 @dataclass(frozen=True, slots=True)
 class AdminCommand:
-    action: str  # 开启 / 关闭 / 状态 / 概率 / 榜 / 我的
-    value: int | None = None  # 仅“概率”有值；None 表示缺参数（提示用法）
-    invalid: bool = False  # “概率”参数存在但不是数字（提示用法）
-    scope: str = ""  # 仅“榜”“我的”有值：today / week / all；空串表示无法识别
+    # action：开启 / 关闭 / 状态 / 概率 / 榜 / 我的 / 免打扰 / 上限 / 帮助
+    action: str
+    value: int | None = None  # “概率”“上限”的数值；None 表示缺参数
+    invalid: bool = False  # 参数存在但无法解析（提示用法）
+    scope: str = ""  # 仅“榜”“我的”：today / week / all；空串表示无法识别
+    text: str = ""  # 仅“免打扰”：时段表达式或 DISABLE_WORD / FOLLOW_WORD
 
 
 def is_valid_board_scope(scope: str) -> bool:
@@ -58,11 +72,28 @@ def _board_scope(remainder: str) -> str:
     return _BOARD_SCOPES.get(text, "")
 
 
+def _accept_remainder(remainder: str) -> bool:
+    """指令词后面的剩余文本是否仍在指令语法内。
+
+    “鉴图榜上无名啊”“我的鉴定结果呢”这类正常聊天只是恰好以前缀开头，
+    不能当成指令（否则会回用法提示并把消息从主 agent 手里截走）。合法情形：
+    没有剩余文本、剩余文本以空白或 @ 开头（用户显式打了分隔），
+    或剩余文本本身就是时间范围词（“我的鉴图本周”）。
+    """
+    if not remainder:
+        return True
+    if remainder[0].isspace() or remainder[0] == "@":
+        return True
+    return _board_scope(remainder) != ""
+
+
 def parse_admin_command(text: str) -> AdminCommand | None:
     """从消息文本解析群管理指令；不匹配返回 None。"""
     value = (text or "").strip()
     if not value.startswith("鉴图") and not value.startswith("我的"):
         return None
+    if _HELP_RE.fullmatch(value):
+        return AdminCommand("帮助")
     match = _SIMPLE_RE.fullmatch(value)
     if match:
         return AdminCommand(match.group(1))
@@ -77,9 +108,32 @@ def parse_admin_command(text: str) -> AdminCommand | None:
             # “鉴图概率 abc”此前会回退成普通鉴图触发，体验差；整体拦下给用法提示。
             return AdminCommand("概率", invalid=True)
     match = _BOARD_RE.fullmatch(value)
-    if match:
+    if match and _accept_remainder(match.group(1)):
         return AdminCommand("榜", scope=_board_scope(match.group(1)))
     match = _MINE_RE.fullmatch(value)
-    if match:
+    if match and _accept_remainder(match.group(1)):
         return AdminCommand("我的", scope=_board_scope(match.group(1)))
+    match = _QUIET_RE.fullmatch(value)
+    if match:
+        raw = (match.group(1) or "").strip()
+        if not raw:
+            return AdminCommand("免打扰")
+        if raw in _DISABLE_WORDS:
+            return AdminCommand("免打扰", text=DISABLE_WORD)
+        if raw in _FOLLOW_WORDS:
+            return AdminCommand("免打扰", text=FOLLOW_WORD)
+        if parse_quiet_hours(raw) is None:
+            return AdminCommand("免打扰", invalid=True)
+        return AdminCommand("免打扰", text=raw)
+    match = _HOURLY_RE.fullmatch(value)
+    if match:
+        raw = (match.group(1) or "").strip()
+        if not raw:
+            return AdminCommand("上限")
+        if raw in _FOLLOW_WORDS:
+            return AdminCommand("上限", text=FOLLOW_WORD)
+        try:
+            return AdminCommand("上限", int(raw))
+        except ValueError:
+            return AdminCommand("上限", invalid=True)
     return None

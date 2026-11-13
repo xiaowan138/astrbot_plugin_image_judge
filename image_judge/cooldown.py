@@ -54,7 +54,8 @@ class HourlyCap:
     """滑动窗口次数上限（群级自动触发防刷屏用）。
 
     与 ``UserCooldown`` 一样区分 ``is_ok``（只判断）与 ``mark``（计数），
-    这样取图失败时不会白白占掉配额。
+    这样取图失败时不会白白占掉配额。上限可按群覆盖：调用时传 ``limit``
+    即为本群生效值，不传则用构造时的全局默认值。
     """
 
     def __init__(
@@ -74,20 +75,24 @@ class HourlyCap:
     def enabled(self) -> bool:
         return self.limit > 0
 
-    async def is_ok(self, key: str) -> bool:
+    def _effective_limit(self, limit: int | None) -> int:
+        return self.limit if limit is None else max(int(limit), 0)
+
+    async def is_ok(self, key: str, *, limit: int | None = None) -> bool:
         """窗口内是否还有余量；不消耗配额。"""
-        if not self.enabled:
+        effective = self._effective_limit(limit)
+        if effective <= 0:
             return True
         now = self._clock()
         async with self._lock:
             recent = self._recent(key, now)
             self._marks[key] = recent
-            return len(recent) < self.limit
+            return len(recent) < effective
 
-    async def mark(self, key: str) -> None:
-        now = self._clock()
-        if not self.enabled:
+    async def mark(self, key: str, *, limit: int | None = None) -> None:
+        if self._effective_limit(limit) <= 0:
             return
+        now = self._clock()
         async with self._lock:
             recent = self._recent(key, now)
             recent.append(now)
